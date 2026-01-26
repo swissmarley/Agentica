@@ -8,6 +8,7 @@ import socket
 import atexit
 import base64
 import platform
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -56,6 +57,10 @@ def get_agents_root() -> Path:
     if root:
         return Path(root)
     return DEFAULT_AGENTS_ROOT
+
+
+def ensure_agents_root(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
 
 
 def format_path(path: Path) -> str:
@@ -109,6 +114,7 @@ def load_profiles() -> dict[str, list[RunProfile]]:
 
 
 AGENTS_ROOT = get_agents_root()
+ensure_agents_root(AGENTS_ROOT)
 RUN_PROFILES = load_profiles()
 
 
@@ -135,6 +141,8 @@ def pid_is_alive(pid: int) -> bool:
 
 
 def pgid_is_alive(pgid: int) -> bool:
+    if platform.system() == "Windows":
+        return False
     try:
         os.killpg(pgid, 0)
     except OSError:
@@ -185,19 +193,76 @@ def list_files(agent_path: Path) -> list[Path]:
                 files.append(path)
     return sorted(files, key=lambda p: str(p).lower())
 
+def venv_python_path(agent_path: Path) -> Path:
+    if platform.system() == "Windows":
+        return agent_path / ".venv" / "Scripts" / "python.exe"
+    return agent_path / ".venv" / "bin" / "python"
+
+def build_windows_command(profile: RunProfile, agent_path: Path) -> tuple[list[str] | None, str | None]:
+    venv_python = venv_python_path(agent_path)
+    if not venv_python.exists():
+        return None, "Missing .venv\\Scripts\\python.exe. Create venv first."
+    command = profile.command.strip()
+    if command.startswith("streamlit "):
+        rest = shlex.split(command[len("streamlit "):].strip(), posix=False)
+        return [str(venv_python), "-m", "streamlit", *rest], None
+    if command.startswith("python3 "):
+        rest = shlex.split(command[len("python3 "):].strip(), posix=False)
+        return [str(venv_python), *rest], None
+    if command.startswith("python "):
+        rest = shlex.split(command[len("python "):].strip(), posix=False)
+        return [str(venv_python), *rest], None
+    if command.startswith("uvicorn "):
+        rest = shlex.split(command[len("uvicorn "):].strip(), posix=False)
+        return [str(venv_python), "-m", "uvicorn", *rest], None
+    return shlex.split(command, posix=False), None
+
 
 def start_process(agent: str, profile: RunProfile, agent_path: Path) -> dict:
     log_path = LOG_DIR / f"{agent}_{profile.label}.log"
-    log_handle = open(log_path, "ab", buffering=0)
-    command = f"source .venv/bin/activate && {profile.command}"
-    process = subprocess.Popen(
-        ["bash", "-lc", command],
-        cwd=agent_path,
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
-    pgid = os.getpgid(process.pid)
+    log_handle = open(log_path, "wb", buffering=0)
+    log_handle.write(f"[agentica] Launching {profile.label}\n".encode("utf-8"))
+    if os.name == "nt" or platform.system() == "Windows":
+        command, error = build_windows_command(profile, agent_path)
+        if error:
+            log_handle.write(f"[agentica] {error}\n".encode("utf-8"))
+            log_handle.flush()
+            return {
+                "agent": agent,
+                "label": profile.label,
+                "pid": None,
+                "pgid": None,
+                "command": profile.command,
+                "streamlit_port": profile.streamlit_port,
+                "cwd": str(agent_path),
+                "log_path": str(log_path),
+                "started_at": time.time(),
+            }
+        log_handle.write(
+            f"[agentica] Command: {' '.join(command)}\n".encode("utf-8")
+        )
+        process = subprocess.Popen(
+            command,
+            cwd=agent_path,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
+        pgid = None
+    else:
+        command = f"source .venv/bin/activate && {profile.command}"
+        log_handle.write(f"[agentica] Command: {command}\n".encode("utf-8"))
+        process = subprocess.Popen(
+            ["bash", "-lc", command],
+            cwd=agent_path,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            pgid = os.getpgid(process.pid)
+        except AttributeError:
+            pgid = None
     return {
         "agent": agent,
         "label": profile.label,
@@ -213,6 +278,13 @@ def start_process(agent: str, profile: RunProfile, agent_path: Path) -> dict:
 
 def stop_process(pid: int, pgid: int | None) -> None:
     try:
+        if platform.system() == "Windows":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return
         if pgid:
             os.killpg(pgid, signal.SIGTERM)
         else:
@@ -348,10 +420,23 @@ def write_env_file(path: Path, rows: list[dict]) -> None:
     path.write_text(content + ("\n" if content else ""))
 
 
+def venv_activate_path(agent_path: Path) -> Path:
+    if platform.system() == "Windows":
+        return agent_path / ".venv" / "Scripts" / "activate"
+    return agent_path / ".venv" / "bin" / "activate"
+
+
+def venv_pip_path(agent_path: Path) -> Path:
+    if platform.system() == "Windows":
+        return agent_path / ".venv" / "Scripts" / "pip.exe"
+    return agent_path / ".venv" / "bin" / "pip"
+
+
 def create_venv(agent_path: Path) -> tuple[bool, str]:
     try:
+        python_cmd = "python" if platform.system() == "Windows" else "python3"
         result = subprocess.run(
-            ["python3", "-m", "venv", ".venv"],
+            [python_cmd, "-m", "venv", ".venv"],
             cwd=agent_path,
             capture_output=True,
             text=True,
@@ -364,9 +449,12 @@ def create_venv(agent_path: Path) -> tuple[bool, str]:
 
 
 def install_requirements(agent_path: Path) -> tuple[bool, str]:
+    pip_path = venv_pip_path(agent_path)
+    if not pip_path.exists():
+        return False, "pip not found in .venv. Create the virtualenv first."
     try:
         result = subprocess.run(
-            ["bash", "-lc", ".venv/bin/pip install -r requirements.txt"],
+            [str(pip_path), "install", "-r", "requirements.txt"],
             cwd=agent_path,
             capture_output=True,
             text=True,
@@ -414,13 +502,17 @@ st.markdown(
         animation: floatIn 0.8s ease;
     }
     .hero-logo {
-        display: inline-flex;
+        display: flex;
         align-items: center;
-        gap: 12px;
-        margin-bottom: 10px;
+        justify-content: center;
+        margin-bottom: 12px;
     }
     .hero-logo img {
-        height: 120px;
+        height: 160px;
+    }
+    .hero-subtitle {
+        text-align: left;
+        margin: 0;
     }
     .app-hero h1 {
         margin: 0 0 6px 0;
@@ -486,15 +578,38 @@ st.markdown(
         color: var(--muted);
         font-weight: 600;
     }
+    [data-testid="stStatusWidget"] * {
+        color: var(--text) !important;
+    }
     .env-card label,
     .env-card span,
     .env-card p,
     .env-card [data-testid="stToggle"] label,
-    .env-card [data-testid="stToggle"] span {
+    .env-card [data-testid="stToggle"] span,
+    .env-card [data-testid="stToggle"] div,
+    .env-card [data-testid="stToggle"] p,
+    .env-card [data-testid="stToggle"] * {
         color: var(--text) !important;
     }
-    .env-card div[data-testid="stHorizontalBlock"] {
+    .env-toggle-label {
+        color: var(--text);
+        font-weight: 600;
+        margin-top: 6px;
+    }
+    .env-toggle [data-testid="stWidgetLabel"] p,
+    .env-toggle [data-testid="stWidgetLabel"] span,
+    .env-toggle [data-testid="stWidgetLabel"] div,
+    .env-toggle [data-testid="stWidgetLabel"] * {
+        color: var(--text) !important;
+    }
+    .env-remove {
+        display: flex;
         align-items: center;
+        justify-content: center;
+        height: 100%;
+    }
+    .env-remove button {
+        height: 40px;
     }
     .env-remove button {
         padding: 0.4rem 0.6rem;
@@ -527,14 +642,14 @@ st.markdown(
     <div class="app-hero">
         <div class="hero-logo">
             {f'<img src="data:image/png;base64,{logo_data}" />' if logo_data else ''}
-            <span class="tag">Agentica</span>
         </div>
         <h1>Orchestrate your AI agents with clarity and control</h1>
-        <p>Manage files, environments, launches, and live output from a single, focused workspace.</p>
+        <p class="hero-subtitle">Manage files, environments, launches, and live output from a single, focused workspace.</p>
     </div>
     """,
     unsafe_allow_html=True,
 )
+
 
 with st.sidebar:
     st.markdown("### Settings")
@@ -589,7 +704,7 @@ with right:
         f'<div class="file-path">{format_path(selected_agent)}</div>',
         unsafe_allow_html=True,
     )
-    venv_exists = (selected_agent / ".venv" / "bin" / "activate").exists()
+    venv_exists = venv_activate_path(selected_agent).exists()
     st.markdown(
         f'<p class="muted">Virtualenv: {"Found" if venv_exists else "Missing"} · '
         f'Files: {len(list_files(selected_agent))}</p>',
@@ -660,12 +775,18 @@ with right:
                 st.session_state.env_next_id = 0
                 st.rerun()
         else:
-            hide_values = st.toggle("Hide values", value=True)
+            col_toggle, col_label = st.columns([0.08, 0.92])
+            with col_toggle:
+                hide_values = st.toggle("Hide values", value=True, label_visibility="collapsed")
+            with col_label:
+                st.markdown('<div class="env-toggle-label">Hide values</div>', unsafe_allow_html=True)
             rows = st.session_state.env_rows
 
             remove_index = None
             for idx, row in enumerate(rows):
-                col_key, col_val, col_remove = st.columns([0.36, 0.54, 0.18])
+                col_key, col_val, col_remove = st.columns(
+                    [0.36, 0.54, 0.18], vertical_alignment="center"
+                )
                 with col_key:
                     st.text_input(
                         "Key",
@@ -714,7 +835,7 @@ with right:
     with setup_tab:
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown("#### Virtual environment")
-        venv_path = selected_agent / ".venv" / "bin" / "activate"
+        venv_path = venv_activate_path(selected_agent)
         if venv_path.exists():
             st.success("Virtualenv found.")
         else:
@@ -762,13 +883,23 @@ with right:
             if st.button("Run agent"):
                 new_items = []
                 for profile in profiles:
-                    item = start_process(selected_agent.name, profile, selected_agent)
+                    try:
+                        item = start_process(selected_agent.name, profile, selected_agent)
+                    except Exception as exc:
+                        st.error(f"Failed to start {profile.label}: {exc}")
+                        continue
+                    if item.get("pid") is None:
+                        st.error(f"{profile.label} not started. Check log for details.")
+                        continue
                     new_items.append(item)
                     if profile.streamlit_port:
                         open_streamlit_tab(profile.streamlit_port)
                 state["processes"].extend(new_items)
                 save_state(state)
-                st.success("Agent started.")
+                if new_items:
+                    st.success("Agent started.")
+                else:
+                    st.warning("No processes started. See launch logs below.")
                 st.rerun()
 
             st.markdown("#### Running agents")
@@ -815,4 +946,5 @@ with right:
                             )
                         else:
                             st.markdown("No output yet.")
+
         st.markdown("</div>", unsafe_allow_html=True)
