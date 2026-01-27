@@ -113,6 +113,10 @@ def load_profiles() -> dict[str, list[RunProfile]]:
     return profiles
 
 
+def save_profiles(profiles: dict[str, list[RunProfile]]) -> None:
+    AGENT_PROFILES_PATH.write_text(json.dumps(serialize_profiles(profiles), indent=2))
+
+
 AGENTS_ROOT = get_agents_root()
 ensure_agents_root(AGENTS_ROOT)
 RUN_PROFILES = load_profiles()
@@ -397,6 +401,151 @@ def stop_builder() -> None:
             pass
 
 
+def ensure_session_default(key: str, value: str) -> None:
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+
+def render_profile_editor(section_key: str) -> None:
+    profiles_key = f"{section_key}_profiles"
+    next_id_key = f"{section_key}_profile_next_id"
+
+    if profiles_key not in st.session_state:
+        st.session_state[profiles_key] = []
+        st.session_state[next_id_key] = 0
+
+    with st.expander("Run profile instructions", expanded=False):
+        st.markdown(
+            "- **Label**: Choose `streamlit`, `backend`, or `custom`.\n"
+            "- **Streamlit**: Provide filename (e.g. `app.py`) and port (e.g. `8510`).\n"
+            "- **Backend**: Provide filename (e.g. `main.py`).\n"
+            "- **Custom**: Provide label and full command manually.\n"
+            "- Example streamlit command: `streamlit run app.py --server.port 8510 --server.headless true`\n"
+            "- Example backend command: `python3 main.py`\n"
+        )
+
+    remove_profile = None
+    for idx, row in enumerate(st.session_state[profiles_key]):
+        row_id = row["id"]
+        col_label, col_file, col_port, col_cmd, col_remove = st.columns(
+            [0.18, 0.24, 0.12, 0.36, 0.1], vertical_alignment="center"
+        )
+
+        type_key = f"{section_key}-type-{row_id}"
+        label_custom_key = f"{section_key}-label-{row_id}"
+        filename_key = f"{section_key}-file-{row_id}"
+        port_key = f"{section_key}-port-{row_id}"
+        cmd_key = f"{section_key}-cmd-{row_id}"
+
+        with col_label:
+            st.selectbox(
+                "Label",
+                ["streamlit", "backend", "custom"],
+                key=type_key,
+                label_visibility="collapsed",
+            )
+
+        label_type = st.session_state.get(type_key, "streamlit")
+
+        with col_file:
+            st.text_input(
+                "Filename",
+                key=filename_key,
+                label_visibility="collapsed",
+                placeholder="app.py" if label_type == "streamlit" else "main.py",
+            )
+
+        with col_port:
+            if label_type == "streamlit":
+                st.text_input(
+                    "Port",
+                    key=port_key,
+                    label_visibility="collapsed",
+                    placeholder="8510",
+                )
+            else:
+                st.markdown("")
+
+        filename = st.session_state.get(filename_key, "").strip()
+        port_raw = st.session_state.get(port_key, "").strip()
+        port_val = port_raw if port_raw else "8510"
+
+        if label_type == "streamlit":
+            default_cmd = f"streamlit run {filename or 'app.py'} --server.port {port_val} --server.headless true"
+        elif label_type == "backend":
+            default_cmd = f"python3 {filename or 'main.py'}"
+        else:
+            default_cmd = ""
+
+        if label_type in ("streamlit", "backend"):
+            st.session_state[cmd_key] = default_cmd
+        else:
+            ensure_session_default(cmd_key, default_cmd)
+
+        with col_cmd:
+            if label_type == "custom":
+                st.text_input(
+                    "Command",
+                    key=cmd_key,
+                    label_visibility="collapsed",
+                    placeholder="your command here",
+                )
+                st.text_input(
+                    "Custom label",
+                    key=label_custom_key,
+                    label_visibility="collapsed",
+                    placeholder="label",
+                )
+            else:
+                st.text_input(
+                    "Command",
+                    key=cmd_key,
+                    label_visibility="collapsed",
+                    disabled=True,
+                )
+
+        with col_remove:
+            st.markdown('<div class="profile-remove">', unsafe_allow_html=True)
+            if st.button("🗑️", key=f"{section_key}-prof-remove-{row_id}"):
+                remove_profile = idx
+            st.markdown("</div>", unsafe_allow_html=True)
+
+    if remove_profile is not None:
+        st.session_state[profiles_key].pop(remove_profile)
+        st.rerun()
+
+    if st.button("Add run profile", key=f"{section_key}-add-profile"):
+        next_id = st.session_state[next_id_key]
+        st.session_state[profiles_key].append({"id": next_id})
+        st.session_state[next_id_key] = next_id + 1
+        st.rerun()
+
+
+def collect_profile_editor(section_key: str) -> list[RunProfile]:
+    profiles_key = f"{section_key}_profiles"
+    profiles = []
+    for row in st.session_state.get(profiles_key, []):
+        row_id = row["id"]
+        label_type = st.session_state.get(f"{section_key}-type-{row_id}", "streamlit")
+        filename = st.session_state.get(f"{section_key}-file-{row_id}", "").strip()
+        port_raw = st.session_state.get(f"{section_key}-port-{row_id}", "").strip()
+        cmd = st.session_state.get(f"{section_key}-cmd-{row_id}", "").strip()
+        label_custom = st.session_state.get(f"{section_key}-label-{row_id}", "").strip()
+
+        if label_type == "custom":
+            label = label_custom
+            if not label or not cmd:
+                continue
+            profiles.append(RunProfile(label, cmd, None))
+        elif label_type == "streamlit":
+            port = int(port_raw) if port_raw.isdigit() else 8510
+            command = f"streamlit run {filename or 'app.py'} --server.port {port} --server.headless true"
+            profiles.append(RunProfile("streamlit", command, port))
+        else:
+            command = f"python3 {filename or 'main.py'}"
+            profiles.append(RunProfile("backend", command, None))
+    return profiles
+
 def load_env_file(path: Path) -> list[dict]:
     if not path.exists():
         return []
@@ -611,6 +760,21 @@ st.markdown(
     .env-remove button {
         height: 40px;
     }
+    .profile-remove {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        height: 100%;
+    }
+    .profile-remove button {
+        width: 36px;
+        height: 36px;
+        padding: 0;
+        border-radius: 10px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
     .env-remove button {
         padding: 0.4rem 0.6rem;
         width: 100%;
@@ -653,6 +817,8 @@ st.markdown(
 
 with st.sidebar:
     st.markdown("### Settings")
+    if st.button("Refresh App"):
+        st.rerun()
     current_root = format_path(get_agents_root())
     agents_root_input = st.text_input("Agents root", value=current_root)
     if st.button("Save root"):
@@ -873,7 +1039,19 @@ with right:
         st.markdown("#### Launch controls")
         profiles = RUN_PROFILES.get(selected_agent.name, [])
         if not profiles:
-            st.info("No run profile configured for this agent.")
+            st.warning("No run profile configured for this agent.")
+            st.markdown("#### Add run profiles")
+            render_profile_editor(f"profile-{selected_agent.name}")
+            if st.button("Save run profiles", key=f"save-profiles-{selected_agent.name}"):
+                new_profiles = collect_profile_editor(f"profile-{selected_agent.name}")
+                if not new_profiles:
+                    st.error("Add at least one run profile.")
+                else:
+                    all_profiles = load_profiles()
+                    all_profiles[selected_agent.name] = new_profiles
+                    save_profiles(all_profiles)
+                    st.success("Run profiles saved.")
+                    st.rerun()
         else:
             existing = [
                 p for p in state["processes"] if p["agent"] == selected_agent.name
