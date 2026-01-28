@@ -1,5 +1,0 @@
-mcp 
-anthropic 
-pydantic 
-requests
-streamlit
