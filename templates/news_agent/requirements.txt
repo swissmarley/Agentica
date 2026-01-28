@@ -1,0 +1,6 @@
+streamlit
+apify-client
+openai
+pandas
+beautifulsoup4
+python-dotenv

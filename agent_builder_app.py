@@ -19,6 +19,7 @@ CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 SETTINGS_PATH = CONFIG_DIR / "settings.json"
 DEFAULT_AGENTS_ROOT = APP_ROOT / "AGENTS"
 PROFILES_PATH = CONFIG_DIR / "agent_profiles.json"
+TEMPLATES_INDEX_PATH = APP_ROOT / "templates" / "templates.json"
 
 
 @dataclass
@@ -79,9 +80,11 @@ def is_valid_agent_name(name: str) -> bool:
 
 
 def safe_filename(name: str) -> bool:
-    if "/" in name or "\\" in name:
+    if name.startswith(("./", ".\\", "/", "\\")):
         return False
-    return bool(re.fullmatch(r"[A-Za-z0-9_.-]+", name))
+    if ".." in name.replace("\\", "/").split("/"):
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9_./-]+", name))
 
 
 def write_agent_files(agent_dir: Path, files: list[AgentFile], overwrite: bool) -> list[str]:
@@ -92,9 +95,12 @@ def write_agent_files(agent_dir: Path, files: list[AgentFile], overwrite: bool) 
     for file in files:
         if not safe_filename(file.path):
             raise ValueError(f"Invalid filename: {file.path}")
-        target = agent_dir / file.path
+        target = (agent_dir / file.path).resolve()
+        if agent_dir.resolve() not in target.parents and target != agent_dir.resolve():
+            raise ValueError(f"Invalid filename: {file.path}")
         if target.exists() and not overwrite:
             continue
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(file.content, encoding="utf-8")
         written.append(str(target))
     return written
@@ -156,6 +162,60 @@ def update_profiles(agent_name: str, profiles: list[dict]) -> None:
     data = load_profiles()
     data[agent_name] = profiles
     save_profiles(data)
+
+
+def load_templates_from_disk() -> dict[str, dict]:
+    if not TEMPLATES_INDEX_PATH.exists():
+        return {}
+    try:
+        index = json.loads(TEMPLATES_INDEX_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(index, dict):
+        return {}
+
+    def apply_vars(text: str) -> str:
+        return text
+
+    templates: dict[str, dict] = {}
+    for entry in index.get("templates", []):
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        root = entry.get("root")
+        description = entry.get("description", "")
+        profiles = entry.get("profiles", [])
+        if not name or not root:
+            continue
+        root_path = (APP_ROOT / root).resolve()
+        if not root_path.exists():
+            continue
+        files: list[AgentFile] = []
+        for path in sorted(root_path.rglob("*")):
+            if path.is_dir():
+                continue
+            rel = path.relative_to(root_path)
+            if rel.name.startswith(".DS_Store"):
+                continue
+            content = path.read_text(encoding="utf-8", errors="ignore")
+            files.append(AgentFile(str(rel), apply_vars(content)))
+        rendered_profiles = []
+        for profile in profiles:
+            if not isinstance(profile, dict):
+                continue
+            rendered = {}
+            for key, value in profile.items():
+                if isinstance(value, str):
+                    rendered[key] = apply_vars(value)
+                else:
+                    rendered[key] = value
+            rendered_profiles.append(rendered)
+        templates[name] = {
+            "description": description,
+            "files": files,
+            "profiles": rendered_profiles,
+        }
+    return templates
 
 def ensure_session_default(key: str, value: str) -> None:
     if key not in st.session_state:
@@ -317,6 +377,14 @@ st.markdown(
     unsafe_allow_html=True,
 )
 st.caption("Create a new agent manually or with GPT-5.2. Files are written into the Agents folder.")
+st.markdown(
+    """
+    <style>
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 agents_root = get_agents_root()
 with st.sidebar:
@@ -331,7 +399,39 @@ with st.sidebar:
 
 agents_root = Path(agents_root_input)
 
-tab_manual, tab_builder = st.tabs(["Manual", "Agent Builder"])
+tab_manual, tab_builder, tab_templates = st.tabs(["Manual", "Agent Builder", "Templates"])
+
+with tab_templates:
+    st.subheader("Starter kits")
+    agent_name_raw = st.text_input("Agent name", key="template-name")
+    agent_name = normalize_agent_name(agent_name_raw)
+    if agent_name and not is_valid_agent_name(agent_name):
+        st.error("Use only letters, numbers, dashes, or underscores.")
+
+    overwrite = st.checkbox("Overwrite existing files", value=False, key="template-overwrite")
+    templates = load_templates_from_disk()
+    if not templates:
+        st.error("No templates found. Ensure templates/templates.json exists.")
+        st.stop()
+    template_name = st.selectbox("Template", list(templates.keys()))
+    template = templates[template_name]
+    st.caption(template["description"])
+
+    with st.expander("Files included", expanded=False):
+        for file in template["files"]:
+            st.markdown(f"- {file.path}")
+
+    if st.button("Create from template"):
+        if not agent_name or not is_valid_agent_name(agent_name):
+            st.error("Provide a valid agent name.")
+        else:
+            agent_dir = agents_root / agent_name
+            try:
+                written = write_agent_files(agent_dir, template["files"], overwrite)
+                update_profiles(agent_name, template["profiles"])
+                st.success(f"Created {agent_name} with {len(written)} files.")
+            except (FileExistsError, ValueError) as exc:
+                st.error(str(exc))
 
 with tab_manual:
     st.subheader("Manual creation")

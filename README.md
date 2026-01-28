@@ -61,6 +61,15 @@ Click **Create Agent** in the top right to launch **Agentica Builder**.
 
 ## 🧠 Agentica Builder Modes
 
+### 🧩 Templates & Starter Kits
+- RAG Agent
+- Web Scraper Agent
+- Ops Monitor Agent
+- Report Generator Agent
+- One-click create with run profiles + README
+- Templates live under `templates/` and can be customized.
+- Templates include LangChain/CrewAI + Streamlit UI and async pipelines.
+
 ### 🛠 Manual Mode
 - Enter agent name
 - Write **README.md**, **requirements.txt**, **.env**
@@ -215,3 +224,7 @@ pip install -r requirements.txt
 ---
 
 Agentica is built to scale with your agents. Happy building! 🚀
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
