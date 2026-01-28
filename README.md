@@ -97,8 +97,20 @@ Agentica can export/import agents as bundles:
 - Bundles include metadata (name, version, tags, requirements) and run profiles
 - Import bundles to create agents from files + manifest
 - Publish bundles to an internal registry (`registry/`)
+- Publish bundles to an external registry endpoint (with optional API key)
+- Push agents to GitHub repositories
+- Bundles include `.env` keys but strip values for safety
 
 Marketplace controls live in the **Marketplace** tab per agent.
+
+---
+
+## 🧾 Workspace Versioning & Rollback
+
+Create lightweight snapshots of an agent’s files + run profiles, view diffs, and revert safely.
+- Snapshots stored under `logs/agent_snapshots/`
+- Includes run profiles and agent metadata
+- Diff viewer and one‑click rollback available in the **Versioning** tab
 
 ---
 

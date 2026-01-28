@@ -18,6 +18,7 @@ import zipfile
 import tempfile
 import shutil
 import urllib.request
+import difflib
 from datetime import datetime
 from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -46,6 +47,8 @@ HEALTH_LOG_PATH = LOG_DIR / "agent_health.log"
 METADATA_PATH = CONFIG_DIR / "agent_metadata.json"
 REGISTRY_DIR = APP_ROOT / "registry"
 REGISTRY_INDEX_PATH = REGISTRY_DIR / "index.json"
+SNAPSHOT_DIR = Path("logs/agent_snapshots")
+SNAPSHOT_INDEX_PATH = SNAPSHOT_DIR / "index.json"
 BUILDER_PORT = 8610
 BUILDER_STATE_PATH = Path("logs/agent_builder_state.json")
 WEBHOOK_PORT = 8625
@@ -241,6 +244,24 @@ def load_registry_index() -> dict:
 def save_registry_index(data: dict) -> None:
     REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
     REGISTRY_INDEX_PATH.write_text(json.dumps(data, indent=2))
+
+
+def load_snapshot_index() -> dict:
+    if not SNAPSHOT_INDEX_PATH.exists():
+        return {"agents": {}}
+    try:
+        data = json.loads(SNAPSHOT_INDEX_PATH.read_text())
+    except json.JSONDecodeError:
+        return {"agents": {}}
+    if not isinstance(data, dict):
+        return {"agents": {}}
+    data.setdefault("agents", {})
+    return data
+
+
+def save_snapshot_index(data: dict) -> None:
+    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    SNAPSHOT_INDEX_PATH.write_text(json.dumps(data, indent=2))
 
 
 def load_trigger_state() -> dict:
@@ -611,6 +632,32 @@ def run_probe_command(agent_path: Path, command: str, timeout: int = 10) -> bool
         return False
 
 
+def sanitize_env_file(path: Path) -> str:
+    if not path.exists():
+        return ""
+    lines = []
+    for raw in path.read_text(errors="ignore").splitlines():
+        line = raw.rstrip("\n")
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            lines.append(line)
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            lines.append(line)
+            continue
+        comment = ""
+        if "#" in value:
+            comment = value[value.index("#") :].strip()
+        placeholder = "YOUR_CREDENTIALS"
+        new_line = f"{key}={placeholder}"
+        if comment:
+            new_line += f" {comment}"
+        lines.append(new_line)
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
 def build_manifest(agent_name: str, agent_path: Path) -> dict:
     metadata = load_metadata().get(agent_name, {})
     requirements_path = agent_path / "requirements.txt"
@@ -639,6 +686,123 @@ def build_manifest(agent_name: str, agent_path: Path) -> dict:
     }
 
 
+def snapshot_agent(agent_name: str, agent_path: Path, note: str) -> Path:
+    SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    snapshot_id = f"{agent_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
+    snapshot_path = SNAPSHOT_DIR / f"{snapshot_id}.zip"
+    manifest = build_manifest(agent_name, agent_path)
+    manifest["note"] = note.strip()
+    manifest["created_at"] = time.time()
+    with zipfile.ZipFile(snapshot_path, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        bundle.writestr("agentica_snapshot.json", json.dumps(manifest, indent=2))
+        for root, dirs, files in os.walk(agent_path):
+            dirs[:] = [d for d in dirs if d not in {".venv", "__pycache__", ".git"}]
+            for filename in files:
+                if filename.endswith(".pyc"):
+                    continue
+                path = Path(root) / filename
+                rel = path.relative_to(agent_path)
+                bundle.write(path, arcname=str(Path("agent") / rel))
+    index = load_snapshot_index()
+    index["agents"].setdefault(agent_name, [])
+    index["agents"][agent_name].append(
+        {
+            "id": snapshot_id,
+            "path": str(snapshot_path),
+            "created_at": manifest["created_at"],
+            "note": manifest["note"],
+            "version": manifest["version"],
+        }
+    )
+    save_snapshot_index(index)
+    return snapshot_path
+
+
+def read_snapshot(snapshot_path: Path) -> dict:
+    with zipfile.ZipFile(snapshot_path, "r") as bundle:
+        manifest = json.loads(bundle.read("agentica_snapshot.json"))
+        files = {}
+        for info in bundle.infolist():
+            if not info.filename.startswith("agent/") or info.is_dir():
+                continue
+            rel = info.filename[len("agent/") :]
+            try:
+                content = bundle.read(info.filename).decode("utf-8")
+            except UnicodeDecodeError:
+                content = ""
+            files[rel] = content
+    return {"manifest": manifest, "files": files}
+
+
+def diff_snapshot_to_current(agent_path: Path, snapshot: dict) -> str:
+    current_files = {}
+    for root, dirs, files in os.walk(agent_path):
+        dirs[:] = [d for d in dirs if d not in {".venv", "__pycache__", ".git"}]
+        for filename in files:
+            if filename.endswith(".pyc"):
+                continue
+            path = Path(root) / filename
+            rel = str(path.relative_to(agent_path))
+            try:
+                current_files[rel] = path.read_text(errors="ignore")
+            except OSError:
+                current_files[rel] = ""
+    snapshot_files = snapshot.get("files", {})
+    all_files = sorted(set(current_files) | set(snapshot_files))
+    diff_chunks = []
+    for rel in all_files:
+        before = snapshot_files.get(rel, "").splitlines()
+        after = current_files.get(rel, "").splitlines()
+        if before == after:
+            continue
+        diff = difflib.unified_diff(
+            before,
+            after,
+            fromfile=f"snapshot/{rel}",
+            tofile=f"current/{rel}",
+            lineterm="",
+        )
+        diff_chunks.extend(list(diff))
+    return "\n".join(diff_chunks)
+
+
+def restore_snapshot(agent_name: str, agent_path: Path, snapshot_path: Path) -> tuple[bool, str]:
+    try:
+        snapshot = read_snapshot(snapshot_path)
+    except Exception as exc:
+        return False, f"Failed to read snapshot: {exc}"
+    agent_folder = agent_path
+    if agent_folder.exists():
+        shutil.rmtree(agent_folder)
+    agent_folder.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(snapshot_path, "r") as bundle:
+        for info in bundle.infolist():
+            if not info.filename.startswith("agent/") or info.is_dir():
+                continue
+            rel = info.filename[len("agent/") :]
+            target = agent_folder / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            data = bundle.read(info.filename)
+            target.write_bytes(data)
+    manifest = snapshot.get("manifest", {})
+    profiles = load_profiles()
+    if manifest.get("profiles"):
+        profiles[agent_name] = [
+            RunProfile(item.get("label"), item.get("command"), item.get("streamlit_port"))
+            for item in manifest.get("profiles", [])
+            if item.get("label") and item.get("command")
+        ]
+        save_profiles(profiles)
+    metadata = load_metadata()
+    metadata[agent_name] = {
+        "version": manifest.get("version", "0.1.0"),
+        "tags": manifest.get("tags", []),
+        "description": manifest.get("description", ""),
+    }
+    save_metadata(metadata)
+    return True, "Snapshot restored."
+
+
 def safe_extract_zip(zip_path: Path, dest: Path) -> None:
     with zipfile.ZipFile(zip_path, "r") as bundle:
         for member in bundle.infolist():
@@ -663,7 +827,11 @@ def export_agent_bundle(agent_name: str, agent_path: Path) -> Path:
                     continue
                 path = Path(root) / filename
                 rel = path.relative_to(agent_path)
-                bundle.write(path, arcname=str(Path("agent") / rel))
+                if rel.name == ".env":
+                    sanitized = sanitize_env_file(path)
+                    bundle.writestr(str(Path("agent") / rel), sanitized)
+                else:
+                    bundle.write(path, arcname=str(Path("agent") / rel))
     return bundle_path
 
 
@@ -1886,8 +2054,8 @@ with right:
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
-    overview_tab, files_tab, env_tab, setup_tab, run_tab, automation_tab, marketplace_tab = st.tabs(
-        ["Overview", "Files", "Environments", "Setup", "Run & Monitor", "Automation", "Marketplace"]
+    overview_tab, files_tab, env_tab, setup_tab, run_tab, automation_tab, marketplace_tab, versioning_tab = st.tabs(
+        ["Overview", "Files", "Environments", "Setup", "Run & Monitor", "Automation", "Marketplace", "Versioning"]
     )
 
     with overview_tab:
@@ -2522,4 +2690,47 @@ with right:
                     f"tags: {', '.join(item.get('tags', []))} · "
                     f"bundle: `{item.get('bundle','')}`"
                 )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with versioning_tab:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown("#### Workspace versioning & rollback")
+
+        note = st.text_input("Snapshot note", value="")
+        if st.button("Create snapshot"):
+            snapshot_path = snapshot_agent(selected_agent.name, selected_agent, note)
+            st.success(f"Snapshot created: {snapshot_path.name}")
+
+        index = load_snapshot_index()
+        entries = index.get("agents", {}).get(selected_agent.name, [])
+        if not entries:
+            st.info("No snapshots yet.")
+        else:
+            entries_sorted = sorted(entries, key=lambda item: item.get("created_at", 0), reverse=True)
+            labels = [
+                f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(e.get('created_at', 0)))} · "
+                f"{e.get('version','')} · {e.get('note','') or 'no note'}"
+                for e in entries_sorted
+            ]
+            selection = st.selectbox("Snapshots", labels)
+            selected_idx = labels.index(selection)
+            snapshot_meta = entries_sorted[selected_idx]
+            snapshot_path = Path(snapshot_meta.get("path", ""))
+            if snapshot_path.exists():
+                st.markdown("#### Diff vs current")
+                snapshot = read_snapshot(snapshot_path)
+                diff_text = diff_snapshot_to_current(selected_agent, snapshot)
+                if diff_text:
+                    st.text_area("Unified diff", value=diff_text, height=320)
+                else:
+                    st.caption("No changes between snapshot and current.")
+                if st.button("Revert to snapshot"):
+                    ok, message = restore_snapshot(selected_agent.name, selected_agent, snapshot_path)
+                    if ok:
+                        st.success(message)
+                        st.rerun()
+                    else:
+                        st.error(message)
+            else:
+                st.error("Snapshot file missing.")
         st.markdown("</div>", unsafe_allow_html=True)
