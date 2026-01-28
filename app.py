@@ -19,6 +19,7 @@ import tempfile
 import shutil
 import urllib.request
 import difflib
+import sqlite3
 from datetime import datetime
 from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,6 +28,12 @@ from pathlib import Path
 
 import streamlit as st
 import streamlit.components.v1 as components
+
+try:
+    from cryptography.fernet import Fernet, InvalidToken
+except Exception:
+    Fernet = None
+    InvalidToken = Exception
 
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -49,6 +56,8 @@ REGISTRY_DIR = APP_ROOT / "registry"
 REGISTRY_INDEX_PATH = REGISTRY_DIR / "index.json"
 SNAPSHOT_DIR = Path("logs/agent_snapshots")
 SNAPSHOT_INDEX_PATH = SNAPSHOT_DIR / "index.json"
+SECRETS_DB_PATH = CONFIG_DIR / "secrets.db"
+SECRETS_KEY_PATH = CONFIG_DIR / "secret.key"
 BUILDER_PORT = 8610
 BUILDER_STATE_PATH = Path("logs/agent_builder_state.json")
 WEBHOOK_PORT = 8625
@@ -264,6 +273,98 @@ def save_snapshot_index(data: dict) -> None:
     SNAPSHOT_INDEX_PATH.write_text(json.dumps(data, indent=2))
 
 
+def ensure_secrets_db() -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(SECRETS_DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS secrets (
+                agent TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value_enc TEXT,
+                value_hash TEXT,
+                updated_at REAL,
+                PRIMARY KEY (agent, key)
+            )
+            """
+        )
+
+
+def get_cipher() -> Fernet:
+    if Fernet is None:
+        raise RuntimeError("cryptography not installed. Run: pip install cryptography")
+    if not SECRETS_KEY_PATH.exists():
+        SECRETS_KEY_PATH.write_bytes(Fernet.generate_key())
+    return Fernet(SECRETS_KEY_PATH.read_bytes())
+
+
+def hash_value(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def load_secrets(agent_name: str) -> list[dict]:
+    ensure_secrets_db()
+    with sqlite3.connect(SECRETS_DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT key, value_enc, updated_at FROM secrets WHERE agent = ? ORDER BY key",
+            (agent_name,),
+        ).fetchall()
+    cipher = get_cipher()
+    secrets = []
+    for key, value_enc, updated_at in rows:
+        value = ""
+        if value_enc:
+            try:
+                value = cipher.decrypt(value_enc.encode("utf-8")).decode("utf-8")
+            except InvalidToken:
+                value = ""
+        secrets.append(
+            {"key": key, "value": value, "updated_at": updated_at, "has_value": bool(value_enc)}
+        )
+    return secrets
+
+
+def set_secret(agent_name: str, key: str, value: str | None) -> None:
+    ensure_secrets_db()
+    cipher = get_cipher()
+    enc_value = None
+    value_hash = None
+    if value:
+        enc_value = cipher.encrypt(value.encode("utf-8")).decode("utf-8")
+        value_hash = hash_value(value)
+    with sqlite3.connect(SECRETS_DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO secrets (agent, key, value_enc, value_hash, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(agent, key) DO UPDATE SET
+                value_enc = excluded.value_enc,
+                value_hash = excluded.value_hash,
+                updated_at = excluded.updated_at
+            """,
+            (agent_name, key, enc_value, value_hash, time.time()),
+        )
+
+
+def delete_secret(agent_name: str, key: str) -> None:
+    ensure_secrets_db()
+    with sqlite3.connect(SECRETS_DB_PATH) as conn:
+        conn.execute(
+            "DELETE FROM secrets WHERE agent = ? AND key = ?",
+            (agent_name, key),
+        )
+
+
+def list_secret_keys(agent_name: str) -> list[str]:
+    ensure_secrets_db()
+    with sqlite3.connect(SECRETS_DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT key FROM secrets WHERE agent = ? ORDER BY key",
+            (agent_name,),
+        ).fetchall()
+    return [row[0] for row in rows]
+
+
 def load_trigger_state() -> dict:
     if not TRIGGER_STATE_PATH.exists():
         return {"last_run": {}, "file_snapshots": {}, "cron_last_minute": {}}
@@ -381,6 +482,7 @@ def start_process(agent: str, profile: RunProfile, agent_path: Path) -> dict:
     log_path = LOG_DIR / f"{agent}_{profile.label}.log"
     log_handle = open(log_path, "wb", buffering=0)
     log_handle.write(f"[agentica] Launching {profile.label}\n".encode("utf-8"))
+    run_env = build_agent_env(agent)
     if os.name == "nt" or platform.system() == "Windows":
         command, error = build_windows_command(profile, agent_path)
         if error:
@@ -406,6 +508,7 @@ def start_process(agent: str, profile: RunProfile, agent_path: Path) -> dict:
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            env=run_env,
         )
         pgid = None
     else:
@@ -417,6 +520,7 @@ def start_process(agent: str, profile: RunProfile, agent_path: Path) -> dict:
             stdout=log_handle,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            env=run_env,
         )
         try:
             pgid = os.getpgid(process.pid)
@@ -527,6 +631,30 @@ def stop_processes_by_port(port: int) -> bool:
     return True
 
 
+def stop_item_process(item: dict) -> tuple[bool, str]:
+    pid = item.get("pid")
+    pgid = item.get("pgid")
+    port = item.get("streamlit_port")
+    if pid:
+        stop_process(pid, pgid)
+    alive = False
+    if pgid:
+        alive = pgid_is_alive(pgid)
+    elif pid:
+        alive = pid_is_alive(pid)
+    if alive and port:
+        stop_processes_by_port(int(port))
+        time.sleep(0.4)
+        alive = pgid_is_alive(pgid) if pgid else pid_is_alive(pid)
+        if alive is False:
+            return True, "Stopped via port."
+    if alive:
+        return False, "Process still running."
+    return True, "Stopped."
+
+
+
+
 def parse_cron_field(field: str, min_value: int, max_value: int) -> set[int] | None:
     field = field.strip()
     if field == "*":
@@ -630,6 +758,28 @@ def http_ping(port: int, timeout: float = 2.0) -> bool:
 def run_probe_command(agent_path: Path, command: str, timeout: int = 10) -> bool:
     if not command.strip():
         return False
+    try:
+        if platform.system() == "Windows":
+            result = subprocess.run(
+                command,
+                cwd=agent_path,
+                shell=True,
+                timeout=timeout,
+                capture_output=True,
+                text=True,
+            )
+        else:
+            wrapped = f"source .venv/bin/activate && {command}"
+            result = subprocess.run(
+                ["bash", "-lc", wrapped],
+                cwd=agent_path,
+                timeout=timeout,
+                capture_output=True,
+                text=True,
+            )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
 
 
 def sanitize_env_file(path: Path) -> str:
@@ -658,6 +808,33 @@ def sanitize_env_file(path: Path) -> str:
     return "\n".join(lines) + ("\n" if lines else "")
 
 
+def build_agent_env(agent_name: str) -> dict:
+    env = os.environ.copy()
+    try:
+        secrets = load_secrets(agent_name)
+    except Exception:
+        secrets = []
+    for item in secrets:
+        value = item.get("value")
+        if value:
+            env[item["key"]] = value
+    agent_path = AGENTS_ROOT / agent_name
+    env_path = agent_path / ".env"
+    if env_path.exists():
+        for row in load_env_file(env_path):
+            key = row.get("key")
+            value = row.get("value")
+            if key and key not in env and value:
+                env[key] = value
+    return env
+
+
+def env_template_from_keys(keys: list[str]) -> str:
+    if not keys:
+        return ""
+    return "\n".join(f"{key}=YOUR_CREDENTIALS" for key in keys) + "\n"
+
+
 def build_manifest(agent_name: str, agent_path: Path) -> dict:
     metadata = load_metadata().get(agent_name, {})
     requirements_path = agent_path / "requirements.txt"
@@ -676,6 +853,13 @@ def build_manifest(agent_name: str, agent_path: Path) -> dict:
         }
         for profile in load_profiles().get(agent_name, [])
     ]
+    env_keys = set(list_secret_keys(agent_name))
+    env_path = agent_path / ".env"
+    if env_path.exists():
+        for row in load_env_file(env_path):
+            key = row.get("key")
+            if key:
+                env_keys.add(key)
     return {
         "name": agent_name,
         "version": metadata.get("version", "0.1.0"),
@@ -683,6 +867,7 @@ def build_manifest(agent_name: str, agent_path: Path) -> dict:
         "description": metadata.get("description", ""),
         "requirements": requirements,
         "profiles": profiles,
+        "env_keys": sorted(env_keys),
     }
 
 
@@ -820,6 +1005,10 @@ def export_agent_bundle(agent_name: str, agent_path: Path) -> Path:
     bundle_path = exports_dir / bundle_name
     with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
         bundle.writestr("agentica_manifest.json", json.dumps(manifest, indent=2))
+        env_keys = manifest.get("env_keys", [])
+        if env_keys:
+            bundle.writestr("agentica_env_keys.json", json.dumps(env_keys, indent=2))
+            bundle.writestr("env.template", env_template_from_keys(env_keys))
         for root, dirs, files in os.walk(agent_path):
             dirs[:] = [d for d in dirs if d not in {".venv", "__pycache__", ".git"}]
             for filename in files:
@@ -828,10 +1017,8 @@ def export_agent_bundle(agent_name: str, agent_path: Path) -> Path:
                 path = Path(root) / filename
                 rel = path.relative_to(agent_path)
                 if rel.name == ".env":
-                    sanitized = sanitize_env_file(path)
-                    bundle.writestr(str(Path("agent") / rel), sanitized)
-                else:
-                    bundle.write(path, arcname=str(Path("agent") / rel))
+                    continue
+                bundle.write(path, arcname=str(Path("agent") / rel))
     return bundle_path
 
 
@@ -879,6 +1066,11 @@ def import_agent_bundle(bundle_bytes: bytes, overwrite: bool) -> tuple[bool, str
             "description": manifest.get("description", ""),
         }
         save_metadata(metadata)
+
+        env_keys = manifest.get("env_keys", [])
+        if env_keys:
+            for key in env_keys:
+                set_secret(agent_name, key, None)
         return True, f"Imported {agent_name}."
 
 
@@ -983,28 +1175,6 @@ def restart_profile_process(agent_name: str, profile: RunProfile, agent_path: Pa
     state.setdefault("processes", []).append(item)
     save_state(state)
     return item
-    try:
-        if platform.system() == "Windows":
-            result = subprocess.run(
-                command,
-                cwd=agent_path,
-                shell=True,
-                timeout=timeout,
-                capture_output=True,
-                text=True,
-            )
-        else:
-            wrapped = f"source .venv/bin/activate && {command}"
-            result = subprocess.run(
-                ["bash", "-lc", wrapped],
-                cwd=agent_path,
-                timeout=timeout,
-                capture_output=True,
-                text=True,
-            )
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, OSError):
-        return False
 
 
 class TriggerManager:
@@ -1686,6 +1856,20 @@ def load_env_file(path: Path) -> list[dict]:
     return rows
 
 
+def migrate_env_to_secrets(agent_name: str, env_path: Path) -> int:
+    if not env_path.exists():
+        return 0
+    rows = load_env_file(env_path)
+    count = 0
+    for row in rows:
+        key = row.get("key")
+        value = row.get("value")
+        if key:
+            set_secret(agent_name, key, value)
+            count += 1
+    return count
+
+
 def write_env_file(path: Path, rows: list[dict]) -> None:
     content = "\n".join(f"{row['key']}={row['value']}" for row in rows)
     path.write_text(content + ("\n" if content else ""))
@@ -1738,6 +1922,7 @@ def install_requirements(agent_path: Path) -> tuple[bool, str]:
 
 
 st.set_page_config(page_title="Agentica", page_icon="🤖", layout="wide")
+ensure_secrets_db()
 TRIGGER_MANAGER.ensure_started()
 HEALTH_MANAGER.ensure_started()
 
@@ -2098,79 +2283,89 @@ with right:
 
     with env_tab:
         st.markdown('<div class="card env-card">', unsafe_allow_html=True)
-        st.markdown("#### Environment variables")
+        st.markdown("#### Secrets manager")
+        if Fernet is None:
+            st.error("Secrets manager requires 'cryptography'. Install it first.")
+            st.stop()
         env_path = selected_agent / ".env"
 
+        if env_path.exists():
+            st.warning("A legacy .env file exists. Migrate it into secrets for safer storage.")
+            st.caption("Agentica will still read .env at runtime until you delete it.")
+            if st.button("Migrate .env to secrets"):
+                count = migrate_env_to_secrets(selected_agent.name, env_path)
+                st.success(f"Migrated {count} keys into secrets.")
+            if st.button("Delete .env"):
+                env_path.unlink(missing_ok=True)
+                st.success("Deleted .env.")
+
+        secrets = load_secrets(selected_agent.name)
         if (
-            st.session_state.get("env_agent") != selected_agent.name
-            or "env_rows" not in st.session_state
+            st.session_state.get("secrets_agent") != selected_agent.name
+            or "secret_rows" not in st.session_state
         ):
-            st.session_state.env_rows = load_env_file(env_path)
-            st.session_state.env_next_id = len(st.session_state.env_rows)
-            st.session_state.env_agent = selected_agent.name
+            st.session_state.secret_rows = [
+                {"id": idx, "key": row["key"], "value": row["value"], "has_value": row["has_value"]}
+                for idx, row in enumerate(secrets)
+            ]
+            st.session_state.secret_next_id = len(st.session_state.secret_rows)
+            st.session_state.secrets_agent = selected_agent.name
 
-        if not env_path.exists():
-            st.info("No .env found for this agent.")
-            if st.button("Create .env"):
-                env_path.write_text("")
-                st.session_state.env_rows = []
-                st.session_state.env_next_id = 0
-                st.rerun()
-        else:
-            col_toggle, col_label = st.columns([0.08, 0.92])
-            with col_toggle:
-                hide_values = st.toggle("Hide values", value=True, label_visibility="collapsed")
-            with col_label:
-                st.markdown('<div class="env-toggle-label">Hide values</div>', unsafe_allow_html=True)
-            rows = st.session_state.env_rows
+        col_toggle, col_label = st.columns([0.08, 0.92])
+        with col_toggle:
+            hide_values = st.toggle("Hide values", value=True, label_visibility="collapsed")
+        with col_label:
+            st.markdown('<div class="env-toggle-label">Hide values</div>', unsafe_allow_html=True)
 
-            remove_index = None
-            for idx, row in enumerate(rows):
-                col_key, col_val, col_remove = st.columns(
-                    [0.36, 0.54, 0.18], vertical_alignment="center"
+        rows = st.session_state.secret_rows
+        remove_index = None
+        for idx, row in enumerate(rows):
+            col_key, col_val, col_remove = st.columns(
+                [0.36, 0.54, 0.18], vertical_alignment="center"
+            )
+            with col_key:
+                st.text_input(
+                    "Key",
+                    value=row.get("key", ""),
+                    key=f"secret-key-{row['id']}",
+                    label_visibility="collapsed",
                 )
-                with col_key:
-                    st.text_input(
-                        "Key",
-                        value=row.get("key", ""),
-                        key=f"env-key-{row['id']}",
-                        label_visibility="collapsed",
-                    )
-                with col_val:
-                    st.text_input(
-                        "Value",
-                        value=row.get("value", ""),
-                        key=f"env-val-{row['id']}",
-                        type="password" if hide_values else "default",
-                        label_visibility="collapsed",
-                    )
-                with col_remove:
-                    st.markdown('<div class="env-remove">', unsafe_allow_html=True)
-                    if st.button("Remove", key=f"env-remove-{idx}"):
-                        remove_index = idx
-                    st.markdown("</div>", unsafe_allow_html=True)
+            with col_val:
+                st.text_input(
+                    "Value",
+                    value=row.get("value", ""),
+                    key=f"secret-val-{row['id']}",
+                    type="password" if hide_values else "default",
+                    label_visibility="collapsed",
+                )
+            with col_remove:
+                st.markdown('<div class="env-remove">', unsafe_allow_html=True)
+                if st.button("Remove", key=f"secret-remove-{idx}"):
+                    remove_index = idx
+                st.markdown("</div>", unsafe_allow_html=True)
 
-            if remove_index is not None:
-                rows.pop(remove_index)
-                st.session_state.env_rows = rows
-                write_env_file(env_path, rows)
-                st.rerun()
+        if remove_index is not None:
+            key_val = rows[remove_index].get("key")
+            if key_val:
+                delete_secret(selected_agent.name, key_val)
+            rows.pop(remove_index)
+            st.session_state.secret_rows = rows
+            st.rerun()
 
-            if st.button("Add variable"):
-                next_id = st.session_state.get("env_next_id", 0)
-                rows.append({"id": next_id, "key": "", "value": ""})
-                st.session_state.env_next_id = next_id + 1
-                st.session_state.env_rows = rows
-                st.rerun()
+        if st.button("Add secret"):
+            next_id = st.session_state.get("secret_next_id", 0)
+            rows.append({"id": next_id, "key": "", "value": "", "has_value": False})
+            st.session_state.secret_next_id = next_id + 1
+            st.session_state.secret_rows = rows
+            st.rerun()
 
+        if st.button("Save secrets"):
             for row in rows:
-                key_val = st.session_state.get(f"env-key-{row['id']}", row.get("key", "")).strip()
-                val_val = st.session_state.get(f"env-val-{row['id']}", row.get("value", ""))
-                row["key"] = key_val
-                row["value"] = val_val
-
-            write_env_file(env_path, [row for row in rows if row.get("key")])
-            st.caption("Saved.")
+                key_val = st.session_state.get(f"secret-key-{row['id']}", row.get("key", "")).strip()
+                val_val = st.session_state.get(f"secret-val-{row['id']}", row.get("value", ""))
+                if key_val:
+                    set_secret(selected_agent.name, key_val, val_val.strip() or None)
+            st.success("Secrets saved.")
 
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -2354,17 +2549,20 @@ with right:
                             f"Stop {item['agent']} {item['label']}",
                             key=f"stop-{item['pid']}",
                         ):
-                            stop_process(item["pid"], item.get("pgid"))
-                            HEALTH_MANAGER.mark_manual_stop(item["agent"], item["label"])
-                            state = load_state()
-                            state["processes"] = [
-                                p for p in state.get("processes", [])
-                                if p.get("pid") != item["pid"]
-                            ]
-                            save_state(state)
-                            refresh_state(state)
-                            st.success("Stop signal sent.")
-                            st.rerun()
+                            stopped, message = stop_item_process(item)
+                            if stopped:
+                                HEALTH_MANAGER.mark_manual_stop(item["agent"], item["label"])
+                                state = load_state()
+                                state["processes"] = [
+                                    p for p in state.get("processes", [])
+                                    if p.get("pid") != item["pid"]
+                                ]
+                                save_state(state)
+                                refresh_state(state)
+                                st.success(message)
+                                st.rerun()
+                            else:
+                                st.error(message)
                         if st.button(
                             f"Restart {item['agent']} {item['label']}",
                             key=f"restart-{item['pid']}",

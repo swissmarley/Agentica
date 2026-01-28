@@ -99,7 +99,7 @@ Agentica can export/import agents as bundles:
 - Publish bundles to an internal registry (`registry/`)
 - Publish bundles to an external registry endpoint (with optional API key)
 - Push agents to GitHub repositories
-- Bundles include `.env` keys but strip values for safety
+- Bundles seed env keys (values are never exported)
 
 Marketplace controls live in the **Marketplace** tab per agent.
 
@@ -208,9 +208,11 @@ This allows each agent to manage its own virtual environment.
 
 ## 🔐 Environment Variables
 
-In each agent:
-- `.env` is managed in the **Environments** tab
-- Variables are editable and saved automatically
+Secrets are managed securely in the **Environments** tab:
+- Values are encrypted at rest using a local key
+- Stored in SQLite with hashed values (`config/secrets.db`)
+- Masked by default in the UI
+- Legacy `.env` files can be migrated into secrets
 
 ---
 
