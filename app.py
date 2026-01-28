@@ -9,6 +9,14 @@ import atexit
 import base64
 import platform
 import shlex
+import threading
+import uuid
+import fnmatch
+import hashlib
+import hmac
+from datetime import datetime
+from urllib.parse import urlparse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,8 +33,12 @@ AGENT_PROFILES_PATH = CONFIG_DIR / "agent_profiles.json"
 STATE_PATH = Path("logs/agent_manager_state.json")
 LOG_DIR = Path("logs/agent_manager_logs")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+TRIGGERS_PATH = CONFIG_DIR / "agent_triggers.json"
+TRIGGER_STATE_PATH = Path("logs/agent_trigger_state.json")
+TRIGGER_LOG_PATH = LOG_DIR / "agent_scheduler.log"
 BUILDER_PORT = 8610
 BUILDER_STATE_PATH = Path("logs/agent_builder_state.json")
+WEBHOOK_PORT = 8625
 
 
 @dataclass(frozen=True)
@@ -134,6 +146,47 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> None:
     STATE_PATH.write_text(json.dumps(state, indent=2))
+
+
+def load_triggers() -> dict[str, list[dict]]:
+    if not TRIGGERS_PATH.exists():
+        return {}
+    try:
+        data = json.loads(TRIGGERS_PATH.read_text())
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_triggers(data: dict[str, list[dict]]) -> None:
+    TRIGGERS_PATH.write_text(json.dumps(data, indent=2))
+
+
+def load_trigger_state() -> dict:
+    if not TRIGGER_STATE_PATH.exists():
+        return {"last_run": {}, "file_snapshots": {}, "cron_last_minute": {}}
+    try:
+        data = json.loads(TRIGGER_STATE_PATH.read_text())
+    except json.JSONDecodeError:
+        return {"last_run": {}, "file_snapshots": {}, "cron_last_minute": {}}
+    if not isinstance(data, dict):
+        return {"last_run": {}, "file_snapshots": {}, "cron_last_minute": {}}
+    data.setdefault("last_run", {})
+    data.setdefault("file_snapshots", {})
+    data.setdefault("cron_last_minute", {})
+    return data
+
+
+def save_trigger_state(data: dict) -> None:
+    TRIGGER_STATE_PATH.write_text(json.dumps(data, indent=2))
+
+
+def append_trigger_log(message: str) -> None:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] {message}\n"
+    TRIGGER_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with TRIGGER_LOG_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(line)
 
 
 def pid_is_alive(pid: int) -> bool:
@@ -319,6 +372,371 @@ def tail_log(path: Path, max_lines: int = 80) -> str:
         return ""
     lines = content.splitlines()
     return "\n".join(lines[-max_lines:])
+
+
+def parse_cron_field(field: str, min_value: int, max_value: int) -> set[int] | None:
+    field = field.strip()
+    if field == "*":
+        return None
+    values: set[int] = set()
+    parts = field.split(",")
+    for part in parts:
+        part = part.strip()
+        if not part:
+            return set()
+        if part.startswith("*/"):
+            try:
+                step = int(part[2:])
+            except ValueError:
+                return set()
+            if step <= 0:
+                return set()
+            values.update(range(min_value, max_value + 1, step))
+            continue
+        if "-" in part:
+            start_str, end_str = part.split("-", 1)
+            try:
+                start = int(start_str)
+                end = int(end_str)
+            except ValueError:
+                return set()
+            if start > end:
+                return set()
+            values.update(range(start, end + 1))
+            continue
+        try:
+            values.add(int(part))
+        except ValueError:
+            return set()
+    return {v for v in values if min_value <= v <= max_value}
+
+
+def cron_matches(expression: str, dt: datetime) -> bool:
+    parts = expression.split()
+    if len(parts) != 5:
+        return False
+    minute_vals = parse_cron_field(parts[0], 0, 59)
+    hour_vals = parse_cron_field(parts[1], 0, 23)
+    day_vals = parse_cron_field(parts[2], 1, 31)
+    month_vals = parse_cron_field(parts[3], 1, 12)
+    weekday_vals = parse_cron_field(parts[4], 0, 7)
+    if minute_vals is not None and dt.minute not in minute_vals:
+        return False
+    if hour_vals is not None and dt.hour not in hour_vals:
+        return False
+    if day_vals is not None and dt.day not in day_vals:
+        return False
+    if month_vals is not None and dt.month not in month_vals:
+        return False
+    if weekday_vals is not None:
+        if 7 in weekday_vals:
+            weekday_vals = set(weekday_vals)
+            weekday_vals.add(0)
+        cron_weekday = (dt.weekday() + 1) % 7
+        if cron_weekday not in weekday_vals:
+            return False
+    return True
+
+
+def scan_files(path: Path, recursive: bool, pattern: str | None) -> set[str]:
+    if not path.exists() or not path.is_dir():
+        return set()
+    files: set[str] = set()
+    if recursive:
+        for root, _, filenames in os.walk(path):
+            for filename in filenames:
+                if pattern and not fnmatch.fnmatch(filename, pattern):
+                    continue
+                files.add(str(Path(root) / filename))
+    else:
+        for entry in path.iterdir():
+            if not entry.is_file():
+                continue
+            if pattern and not fnmatch.fnmatch(entry.name, pattern):
+                continue
+            files.add(str(entry))
+    return files
+
+
+class TriggerManager:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._webhook_server: ThreadingHTTPServer | None = None
+        self._webhook_thread: threading.Thread | None = None
+        self._triggers: dict[str, list[dict]] = {}
+        self._triggers_mtime: float = 0.0
+        self._state = load_trigger_state()
+
+    def ensure_started(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+        self._start_webhook_server()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._webhook_server:
+            try:
+                self._webhook_server.shutdown()
+            except Exception:
+                pass
+
+    def _start_webhook_server(self) -> None:
+        if self._webhook_thread and self._webhook_thread.is_alive():
+            return
+
+        manager = self
+
+        class WebhookHandler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                body = self.rfile.read(length)
+                path = urlparse(self.path).path
+                status, message = manager.handle_webhook(path, self.headers, body)
+                self.send_response(status)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(message.encode("utf-8"))
+
+            def log_message(self, format: str, *args) -> None:
+                return
+
+        try:
+            server = ThreadingHTTPServer(("0.0.0.0", WEBHOOK_PORT), WebhookHandler)
+        except OSError as exc:
+            append_trigger_log(f"Webhook server failed to start: {exc}")
+            return
+        self._webhook_server = server
+        self._webhook_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        self._webhook_thread.start()
+        append_trigger_log(f"Webhook server listening on port {WEBHOOK_PORT}.")
+
+    def _reload_triggers_if_needed(self) -> None:
+        try:
+            mtime = TRIGGERS_PATH.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        if mtime == self._triggers_mtime:
+            return
+        self._triggers = load_triggers()
+        self._triggers_mtime = mtime
+
+    def reload_triggers(self) -> None:
+        self._triggers = load_triggers()
+        try:
+            self._triggers_mtime = TRIGGERS_PATH.stat().st_mtime
+        except OSError:
+            self._triggers_mtime = 0.0
+
+    def _run_loop(self) -> None:
+        append_trigger_log("Scheduler loop started.")
+        while not self._stop_event.is_set():
+            try:
+                self._reload_triggers_if_needed()
+                self._check_schedules()
+                self._check_file_triggers()
+            except Exception as exc:
+                append_trigger_log(f"Scheduler error: {exc}")
+            self._stop_event.wait(10)
+
+    def _check_schedules(self) -> None:
+        now = datetime.now()
+        for agent_name, rules in self._triggers.items():
+            for rule in rules:
+                if not rule.get("enabled", True):
+                    continue
+                if rule.get("kind") != "schedule":
+                    continue
+                schedule_type = rule.get("schedule_type")
+                rule_id = rule.get("id")
+                if not rule_id:
+                    continue
+                if schedule_type == "hourly":
+                    minute = int(rule.get("minute", 0))
+                    if now.minute != minute:
+                        continue
+                    last_run = self._state["last_run"].get(rule_id)
+                    if last_run and datetime.fromtimestamp(last_run).hour == now.hour and datetime.fromtimestamp(last_run).date() == now.date():
+                        continue
+                    self._trigger_rule(rule, agent_name, "hourly schedule")
+                elif schedule_type == "daily":
+                    minute = int(rule.get("minute", 0))
+                    hour = int(rule.get("hour", 0))
+                    if now.hour != hour or now.minute != minute:
+                        continue
+                    last_run = self._state["last_run"].get(rule_id)
+                    if last_run and datetime.fromtimestamp(last_run).date() == now.date():
+                        continue
+                    self._trigger_rule(rule, agent_name, "daily schedule")
+                elif schedule_type == "cron":
+                    expression = rule.get("cron", "").strip()
+                    if not expression:
+                        continue
+                    minute_key = now.strftime("%Y-%m-%d %H:%M")
+                    if self._state["cron_last_minute"].get(rule_id) == minute_key:
+                        continue
+                    if cron_matches(expression, now):
+                        self._trigger_rule(rule, agent_name, f"cron {expression}")
+                        self._state["cron_last_minute"][rule_id] = minute_key
+                        save_trigger_state(self._state)
+
+    def _check_file_triggers(self) -> None:
+        for agent_name, rules in self._triggers.items():
+            for rule in rules:
+                if not rule.get("enabled", True):
+                    continue
+                if rule.get("kind") != "event":
+                    continue
+                event_type = rule.get("event_type")
+                if event_type not in {"file_new", "file_change"}:
+                    continue
+                rule_id = rule.get("id")
+                folder = Path(rule.get("path", ""))
+                if not rule_id or not folder.exists():
+                    continue
+                recursive = bool(rule.get("recursive", False))
+                pattern = rule.get("pattern") or None
+                snapshot = scan_files(folder, recursive, pattern)
+                prev_snapshot = set(self._state["file_snapshots"].get(rule_id, []))
+                if event_type == "file_new":
+                    if not prev_snapshot:
+                        self._state["file_snapshots"][rule_id] = list(snapshot)
+                        save_trigger_state(self._state)
+                        continue
+                    new_files = snapshot - prev_snapshot
+                    if new_files:
+                        self._trigger_rule(rule, agent_name, f"new files in {folder}")
+                        self._state["file_snapshots"][rule_id] = list(snapshot)
+                        save_trigger_state(self._state)
+                else:
+                    last_scan = self._state["last_run"].get(rule_id, 0)
+                    if not last_scan:
+                        self._state["last_run"][rule_id] = time.time()
+                        save_trigger_state(self._state)
+                        continue
+                    changed = False
+                    for file_path in snapshot:
+                        try:
+                            mtime = Path(file_path).stat().st_mtime
+                        except OSError:
+                            continue
+                        if mtime > last_scan:
+                            changed = True
+                            break
+                    if changed:
+                        self._trigger_rule(rule, agent_name, f"file change in {folder}")
+
+    def handle_webhook(self, path: str, headers: dict, body: bytes) -> tuple[int, str]:
+        self._reload_triggers_if_needed()
+        matched = []
+        for agent_name, rules in self._triggers.items():
+            for rule in rules:
+                if not rule.get("enabled", True):
+                    continue
+                if rule.get("kind") != "event":
+                    continue
+                event_type = rule.get("event_type")
+                if event_type not in {"webhook", "github_push"}:
+                    continue
+                hook_path = rule.get("webhook_path")
+                if hook_path != path:
+                    continue
+                matched.append((agent_name, rule))
+
+        if not matched:
+            return 404, "No trigger registered for this path."
+
+        for agent_name, rule in matched:
+            event_type = rule.get("event_type")
+            if event_type == "github_push":
+                if headers.get("X-GitHub-Event") != "push":
+                    continue
+                secret = rule.get("secret")
+                if secret:
+                    signature = headers.get("X-Hub-Signature-256") or ""
+                    digest = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+                    expected = f"sha256={digest}"
+                    if not hmac.compare_digest(signature, expected):
+                        append_trigger_log("GitHub webhook signature mismatch.")
+                        return 401, "Invalid signature."
+            else:
+                secret = rule.get("secret")
+                if secret:
+                    header_name = rule.get("secret_header") or "X-Agentica-Token"
+                    provided = headers.get(header_name, "")
+                    if not hmac.compare_digest(provided, secret):
+                        append_trigger_log("Webhook secret mismatch.")
+                        return 401, "Invalid token."
+            self._trigger_rule(rule, agent_name, f"webhook {path}")
+        return 200, "OK"
+
+    def _trigger_rule(self, rule: dict, agent_name: str, reason: str) -> None:
+        profile_label = rule.get("profile_label")
+        if not profile_label:
+            append_trigger_log(f"Trigger skipped for {agent_name}: missing profile label.")
+            return
+        with self._lock:
+            state = refresh_state(load_state())
+            if rule.get("skip_if_running", True):
+                for item in state.get("processes", []):
+                    if item.get("agent") == agent_name and item.get("label") == profile_label:
+                        append_trigger_log(
+                            f"Skipped trigger for {agent_name}:{profile_label} (already running)."
+                        )
+                        return
+            profiles = load_profiles()
+            profile = None
+            for p in profiles.get(agent_name, []):
+                if p.label == profile_label:
+                    profile = p
+                    break
+            if not profile:
+                append_trigger_log(
+                    f"Trigger failed for {agent_name}:{profile_label} (profile not found)."
+                )
+                return
+            agent_path = next((p for p in list_agents() if p.name == agent_name), None)
+            if not agent_path:
+                append_trigger_log(f"Trigger failed for {agent_name} (agent path not found).")
+                return
+            try:
+                item = start_process(agent_name, profile, agent_path)
+            except Exception as exc:
+                append_trigger_log(
+                    f"Trigger failed for {agent_name}:{profile_label} ({exc})."
+                )
+                return
+            if item.get("pid") is None:
+                append_trigger_log(
+                    f"Trigger failed for {agent_name}:{profile_label} (process not started)."
+                )
+                return
+            state["processes"].append(item)
+            save_state(state)
+            self._state["last_run"][rule.get("id")] = time.time()
+            save_trigger_state(self._state)
+            append_trigger_log(
+                f"Triggered {agent_name}:{profile_label} via {reason}."
+            )
+
+    def trigger_now(self, agent_name: str, rule_id: str) -> None:
+        self._reload_triggers_if_needed()
+        rule = None
+        for item in self._triggers.get(agent_name, []):
+            if item.get("id") == rule_id:
+                rule = item
+                break
+        if not rule:
+            append_trigger_log(f"Manual trigger failed: rule {rule_id} not found.")
+            return
+        self._trigger_rule(rule, agent_name, "manual trigger")
+
+
+TRIGGER_MANAGER = TriggerManager()
+atexit.register(TRIGGER_MANAGER.stop)
 
 
 def open_streamlit_tab(port: int) -> None:
@@ -616,6 +1034,7 @@ def install_requirements(agent_path: Path) -> tuple[bool, str]:
 
 
 st.set_page_config(page_title="Agentica", page_icon="🤖", layout="wide")
+TRIGGER_MANAGER.ensure_started()
 
 st.markdown(
     """
@@ -710,6 +1129,15 @@ st.markdown(
         padding: 0.6rem 1.1rem;
         transition: transform 0.2s ease, box-shadow 0.2s ease;
     }
+    [data-testid="stFormSubmitButton"] button {
+        background: var(--accent) !important;
+        color: #1a1a1a !important;
+    }
+    [data-testid="baseButton-secondary"] {
+        background: var(--card-2) !important;
+        color: var(--text) !important;
+        border: 1px solid var(--border) !important;
+    }
     .stButton>button:hover {
         transform: translateY(-2px);
         box-shadow: 0 12px 24px rgba(0,0,0,0.2);
@@ -786,6 +1214,20 @@ st.markdown(
     .stTabs [aria-selected="true"] {
         color: var(--text);
         border-color: var(--accent);
+    }
+    [data-testid="stWidgetLabel"] p,
+    [data-testid="stWidgetLabel"] span,
+    [data-testid="stWidgetLabel"] div,
+    [data-testid="stWidgetLabel"] * {
+        color: var(--text) !important;
+    }
+    .stSelectbox label,
+    .stTextInput label,
+    .stNumberInput label,
+    .stTextarea label,
+    .stMultiSelect label,
+    .stCheckbox label {
+        color: var(--text) !important;
     }
     @keyframes floatIn {
         from { opacity: 0; transform: translateY(12px); }
@@ -878,8 +1320,8 @@ with right:
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
-    overview_tab, files_tab, env_tab, setup_tab, run_tab = st.tabs(
-        ["Overview", "Files", "Environments", "Setup", "Run & Monitor"]
+    overview_tab, files_tab, env_tab, setup_tab, run_tab, automation_tab = st.tabs(
+        ["Overview", "Files", "Environments", "Setup", "Run & Monitor", "Automation"]
     )
 
     with overview_tab:
@@ -1125,4 +1567,177 @@ with right:
                         else:
                             st.markdown("No output yet.")
 
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with automation_tab:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown("#### Schedules & triggers")
+        triggers_data = load_triggers()
+        agent_rules = triggers_data.get(selected_agent.name, [])
+        trigger_state = load_trigger_state()
+
+        if not agent_rules:
+            st.info("No schedules or triggers configured for this agent.")
+        else:
+            for rule in agent_rules:
+                rule_id = rule.get("id", "")
+                title = rule.get("label") or rule.get("kind", "Automation").title()
+                with st.expander(title, expanded=False):
+                    profile_label = rule.get("profile_label", "unknown")
+                    kind = rule.get("kind", "schedule")
+                    enabled_key = f"trigger-enabled-{rule_id}"
+                    if enabled_key not in st.session_state:
+                        st.session_state[enabled_key] = rule.get("enabled", True)
+                    enabled_val = st.toggle("Enabled", key=enabled_key)
+                    if enabled_val != rule.get("enabled", True):
+                        rule["enabled"] = enabled_val
+                        triggers_data[selected_agent.name] = agent_rules
+                        save_triggers(triggers_data)
+                        TRIGGER_MANAGER.reload_triggers()
+                    st.markdown(f"**Profile:** `{profile_label}` · **Type:** `{kind}`")
+                    if kind == "schedule":
+                        schedule_type = rule.get("schedule_type", "hourly")
+                        if schedule_type == "hourly":
+                            st.markdown(f"Runs hourly at minute `{rule.get('minute', 0)}`.")
+                        elif schedule_type == "daily":
+                            st.markdown(
+                                f"Runs daily at `{rule.get('hour', 0):02d}:{rule.get('minute', 0):02d}`."
+                            )
+                        else:
+                            st.markdown(f"Cron: `{rule.get('cron', '* * * * *')}`")
+                    else:
+                        event_type = rule.get("event_type")
+                        if event_type in {"file_new", "file_change"}:
+                            st.markdown(
+                                f"Folder: `{rule.get('path', '')}` · Pattern: `{rule.get('pattern', '*')}`"
+                            )
+                            st.markdown(
+                                f"Recursive: `{rule.get('recursive', False)}` · Event: `{event_type}`"
+                            )
+                        else:
+                            hook_path = rule.get("webhook_path", "")
+                            st.markdown(
+                                f"Webhook URL: `http://localhost:{WEBHOOK_PORT}{hook_path}`"
+                            )
+                            if event_type == "github_push":
+                                st.caption("GitHub event: push")
+                    last_run = trigger_state.get("last_run", {}).get(rule_id)
+                    if last_run:
+                        st.markdown(
+                            f"**Last run:** {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_run))}"
+                        )
+                    col_run, col_delete = st.columns([0.2, 0.8])
+                    with col_run:
+                        if st.button("Run now", key=f"trigger-run-{rule_id}"):
+                            TRIGGER_MANAGER.trigger_now(selected_agent.name, rule_id)
+                            st.success("Trigger fired.")
+                    with col_delete:
+                        if st.button("Delete", key=f"trigger-delete-{rule_id}"):
+                            agent_rules[:] = [r for r in agent_rules if r.get("id") != rule_id]
+                            if agent_rules:
+                                triggers_data[selected_agent.name] = agent_rules
+                            else:
+                                triggers_data.pop(selected_agent.name, None)
+                            save_triggers(triggers_data)
+                            st.rerun()
+
+        st.markdown("#### Add automation")
+        profiles = load_profiles().get(selected_agent.name, [])
+        profile_labels = [p.label for p in profiles]
+        if not profile_labels:
+            st.warning("Add run profiles before creating schedules or triggers.")
+        else:
+            with st.form(f"add-trigger-{selected_agent.name}"):
+                rule_kind = st.selectbox("Automation type", ["Schedule", "Event"])
+                label = st.text_input("Label", value="")
+                profile_choice = st.selectbox("Run profile", profile_labels)
+                enabled = st.checkbox("Enabled", value=True)
+                skip_if_running = st.checkbox("Skip if already running", value=True)
+
+                schedule_type = "hourly"
+                minute = 0
+                hour = 0
+                cron_expr = ""
+                event_type = "file_new"
+                folder_path = ""
+                pattern = "*"
+                recursive = False
+                secret = ""
+                secret_header = "X-Agentica-Token"
+
+                if rule_kind == "Schedule":
+                    schedule_type = st.selectbox(
+                        "Schedule type", ["hourly", "daily", "cron"]
+                    )
+                    if schedule_type == "hourly":
+                        minute = st.number_input("Minute", min_value=0, max_value=59, value=0)
+                    elif schedule_type == "daily":
+                        hour = st.number_input("Hour", min_value=0, max_value=23, value=9)
+                        minute = st.number_input("Minute", min_value=0, max_value=59, value=0)
+                    else:
+                        cron_expr = st.text_input("Cron (min hour day month weekday)", value="0 * * * *")
+                        st.caption("Weekday uses 0=Sunday..6=Saturday (7 also treated as Sunday).")
+                else:
+                    event_type = st.selectbox(
+                        "Event type", ["file_new", "file_change", "webhook", "github_push"]
+                    )
+                    if event_type in {"file_new", "file_change"}:
+                        folder_path = st.text_input("Folder path", value=str(selected_agent))
+                        pattern = st.text_input("Filename pattern", value="*")
+                        recursive = st.checkbox("Recursive", value=False)
+                    elif event_type == "webhook":
+                        secret = st.text_input("Webhook token (optional)", value="")
+                        secret_header = st.text_input(
+                            "Token header", value="X-Agentica-Token"
+                        )
+                    else:
+                        secret = st.text_input("GitHub webhook secret (optional)", value="")
+                submitted = st.form_submit_button("Create automation")
+
+            if submitted:
+                rule_id = uuid.uuid4().hex
+                rule_label = label.strip() or f"{rule_kind.lower()}-{rule_id[:8]}"
+                new_rule: dict[str, object] = {
+                    "id": rule_id,
+                    "label": rule_label,
+                    "profile_label": profile_choice,
+                    "kind": "schedule" if rule_kind == "Schedule" else "event",
+                    "enabled": enabled,
+                    "skip_if_running": skip_if_running,
+                }
+                if rule_kind == "Schedule":
+                    new_rule["schedule_type"] = schedule_type
+                    if schedule_type == "hourly":
+                        new_rule["minute"] = int(minute)
+                    elif schedule_type == "daily":
+                        new_rule["hour"] = int(hour)
+                        new_rule["minute"] = int(minute)
+                    else:
+                        new_rule["cron"] = cron_expr.strip()
+                else:
+                    new_rule["event_type"] = event_type
+                    if event_type in {"file_new", "file_change"}:
+                        new_rule["path"] = folder_path.strip()
+                        new_rule["pattern"] = pattern.strip() or "*"
+                        new_rule["recursive"] = bool(recursive)
+                    else:
+                        new_rule["webhook_path"] = f"/hook/{rule_id}"
+                        if secret:
+                            new_rule["secret"] = secret.strip()
+                        if event_type == "webhook":
+                            new_rule["secret_header"] = secret_header.strip() or "X-Agentica-Token"
+                triggers = load_triggers()
+                triggers.setdefault(selected_agent.name, [])
+                triggers[selected_agent.name].append(new_rule)
+                save_triggers(triggers)
+                st.success("Automation saved.")
+                st.rerun()
+
+        if TRIGGER_LOG_PATH.exists():
+            st.markdown("#### Automation log")
+            st.text_area(
+                "Recent scheduler output",
+                value=tail_log(TRIGGER_LOG_PATH, max_lines=120),
+                height=220,
+            )
         st.markdown("</div>", unsafe_allow_html=True)
