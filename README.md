@@ -108,6 +108,47 @@ Example:
 
 ---
 
+## ⏱️ Schedules & Triggers (Automation)
+
+Automation rules are stored in:
+```
+config/agent_triggers.json
+```
+
+Supported automations:
+- **Hourly / Daily** schedules
+- **Cron-like** schedules (5-field: minute hour day month weekday)
+- **File events**: new file or file change in a folder
+- **Webhooks**: generic webhook or GitHub push
+
+Webhook listener:
+```
+http://localhost:8625/hook/<trigger_id>
+```
+
+Each automation runs a selected **run profile** for its agent.
+
+---
+
+## 🩺 Health & Monitoring
+
+Each run profile can have:
+- **Health probes** (HTTP ping or custom command)
+- **Auto‑restart on crash**
+- **Status, uptime, last log line time, restart count**
+
+Health settings are stored in:
+```
+config/agent_health.json
+```
+
+Runtime health state is stored in:
+```
+logs/agent_health_state.json
+```
+
+---
+
 ## ⚙️ Settings
 
 Settings are stored in:
@@ -174,7 +215,3 @@ pip install -r requirements.txt
 ---
 
 Agentica is built to scale with your agents. Happy building! 🚀
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

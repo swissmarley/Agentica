@@ -36,6 +36,9 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 TRIGGERS_PATH = CONFIG_DIR / "agent_triggers.json"
 TRIGGER_STATE_PATH = Path("logs/agent_trigger_state.json")
 TRIGGER_LOG_PATH = LOG_DIR / "agent_scheduler.log"
+HEALTH_CONFIG_PATH = CONFIG_DIR / "agent_health.json"
+HEALTH_STATE_PATH = Path("logs/agent_health_state.json")
+HEALTH_LOG_PATH = LOG_DIR / "agent_health.log"
 BUILDER_PORT = 8610
 BUILDER_STATE_PATH = Path("logs/agent_builder_state.json")
 WEBHOOK_PORT = 8625
@@ -160,6 +163,45 @@ def load_triggers() -> dict[str, list[dict]]:
 
 def save_triggers(data: dict[str, list[dict]]) -> None:
     TRIGGERS_PATH.write_text(json.dumps(data, indent=2))
+
+
+def load_health_config() -> dict:
+    if not HEALTH_CONFIG_PATH.exists():
+        return {}
+    try:
+        data = json.loads(HEALTH_CONFIG_PATH.read_text())
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_health_config(data: dict) -> None:
+    HEALTH_CONFIG_PATH.write_text(json.dumps(data, indent=2))
+
+
+def load_health_state() -> dict:
+    if not HEALTH_STATE_PATH.exists():
+        return {"profiles": {}}
+    try:
+        data = json.loads(HEALTH_STATE_PATH.read_text())
+    except json.JSONDecodeError:
+        return {"profiles": {}}
+    if not isinstance(data, dict):
+        return {"profiles": {}}
+    data.setdefault("profiles", {})
+    return data
+
+
+def save_health_state(data: dict) -> None:
+    HEALTH_STATE_PATH.write_text(json.dumps(data, indent=2))
+
+
+def append_health_log(message: str) -> None:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] {message}\n"
+    HEALTH_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with HEALTH_LOG_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(line)
 
 
 def load_trigger_state() -> dict:
@@ -374,6 +416,57 @@ def tail_log(path: Path, max_lines: int = 80) -> str:
     return "\n".join(lines[-max_lines:])
 
 
+def find_pids_by_port(port: int) -> list[int]:
+    pids: list[int] = []
+    if platform.system() == "Windows":
+        try:
+            result = subprocess.run(
+                ["netstat", "-ano"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except (subprocess.CalledProcessError, OSError):
+            return pids
+        for line in result.stdout.splitlines():
+            if f":{port} " not in line:
+                continue
+            parts = line.split()
+            if len(parts) >= 5:
+                pid = parts[-1]
+                if pid.isdigit():
+                    pids.append(int(pid))
+        return sorted(set(pids))
+    for cmd in (["lsof", "-ti", f"tcp:{port}"], ["fuser", "-n", "tcp", str(port)]):
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+            continue
+        for token in result.stdout.replace(",", " ").split():
+            if token.isdigit():
+                pids.append(int(token))
+    return sorted(set(pids))
+
+
+def stop_processes_by_port(port: int) -> bool:
+    pids = find_pids_by_port(port)
+    if not pids:
+        return False
+    for pid in pids:
+        try:
+            if platform.system() == "Windows":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            else:
+                os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+    return True
+
+
 def parse_cron_field(field: str, min_value: int, max_value: int) -> set[int] | None:
     field = field.strip()
     if field == "*":
@@ -456,6 +549,75 @@ def scan_files(path: Path, recursive: bool, pattern: str | None) -> set[str]:
                 continue
             files.add(str(entry))
     return files
+
+
+def profile_key(agent_name: str, label: str) -> str:
+    return f"{agent_name}::{label}"
+
+
+def http_ping(port: int, timeout: float = 2.0) -> bool:
+    try:
+        conn = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        conn.settimeout(timeout)
+        conn.sendall(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+        conn.recv(1)
+        conn.close()
+        return True
+    except OSError:
+        return False
+
+
+def run_probe_command(agent_path: Path, command: str, timeout: int = 10) -> bool:
+    if not command.strip():
+        return False
+
+
+def restart_profile_process(agent_name: str, profile: RunProfile, agent_path: Path) -> dict | None:
+    state = load_state()
+    stopped = False
+    for item in list(state.get("processes", [])):
+        if item.get("agent") == agent_name and item.get("label") == profile.label:
+            stop_process(item["pid"], item.get("pgid"))
+            state["processes"] = [
+                p for p in state.get("processes", [])
+                if not (p.get("agent") == agent_name and p.get("label") == profile.label)
+            ]
+            stopped = True
+    save_state(state)
+    if stopped:
+        time.sleep(0.3)
+    try:
+        item = start_process(agent_name, profile, agent_path)
+    except Exception:
+        return None
+    if item.get("pid") is None:
+        return None
+    state = load_state()
+    state.setdefault("processes", []).append(item)
+    save_state(state)
+    return item
+    try:
+        if platform.system() == "Windows":
+            result = subprocess.run(
+                command,
+                cwd=agent_path,
+                shell=True,
+                timeout=timeout,
+                capture_output=True,
+                text=True,
+            )
+        else:
+            wrapped = f"source .venv/bin/activate && {command}"
+            result = subprocess.run(
+                ["bash", "-lc", wrapped],
+                cwd=agent_path,
+                timeout=timeout,
+                capture_output=True,
+                text=True,
+            )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
 
 
 class TriggerManager:
@@ -716,6 +878,7 @@ class TriggerManager:
                 return
             state["processes"].append(item)
             save_state(state)
+            HEALTH_MANAGER.clear_manual_stop(agent_name, profile_label)
             self._state["last_run"][rule.get("id")] = time.time()
             save_trigger_state(self._state)
             append_trigger_log(
@@ -737,6 +900,160 @@ class TriggerManager:
 
 TRIGGER_MANAGER = TriggerManager()
 atexit.register(TRIGGER_MANAGER.stop)
+
+
+class HealthManager:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def ensure_started(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def _run_loop(self) -> None:
+        append_health_log("Health loop started.")
+        while not self._stop_event.is_set():
+            try:
+                self._check_health()
+            except Exception as exc:
+                append_health_log(f"Health error: {exc}")
+            self._stop_event.wait(15)
+
+    def _check_health(self) -> None:
+        with self._lock:
+            health_config = load_health_config()
+            profiles_by_agent = load_profiles()
+            for agent_name, profiles in profiles_by_agent.items():
+                for profile in profiles:
+                    key = profile_key(agent_name, profile.label)
+                    if key not in health_config:
+                        health_config[key] = {
+                            "probe_type": "http" if profile.streamlit_port else "disabled",
+                            "port": profile.streamlit_port,
+                            "probe_command": "",
+                            "auto_restart": False,
+                        }
+            save_health_config(health_config)
+            health_state = load_health_state()
+            state = refresh_state(load_state())
+            running = state.get("processes", [])
+            running_keys = {
+                profile_key(item["agent"], item["label"]): item for item in running
+            }
+            now = time.time()
+
+            for key, config in health_config.items():
+                agent_name, label = key.split("::", 1)
+                status_entry = health_state["profiles"].setdefault(
+                    key,
+                    {
+                        "status": "unknown",
+                        "last_check": None,
+                        "last_log_time": None,
+                        "restart_count": 0,
+                        "last_pid": None,
+                        "manual_stop": False,
+                        "last_ok": None,
+                        "last_failure": "",
+                    },
+                )
+                running_item = running_keys.get(key)
+                if running_item:
+                    status_entry["last_pid"] = running_item.get("pid")
+                    log_path = Path(running_item.get("log_path", ""))
+                    if log_path.exists():
+                        try:
+                            status_entry["last_log_time"] = log_path.stat().st_mtime
+                        except OSError:
+                            pass
+                    ok = True
+                    probe_type = config.get("probe_type")
+                    if probe_type == "disabled":
+                        ok = True
+                    elif probe_type == "http":
+                        port = config.get("port")
+                        if isinstance(port, int):
+                            ok = http_ping(port)
+                        else:
+                            ok = False
+                    elif probe_type == "command":
+                        cmd = config.get("probe_command", "")
+                        agent_path = next((p for p in list_agents() if p.name == agent_name), None)
+                        ok = bool(agent_path) and run_probe_command(agent_path, cmd)
+                    status_entry["status"] = "healthy" if ok else "unhealthy"
+                    status_entry["last_check"] = now
+                    if ok:
+                        status_entry["last_ok"] = now
+                        status_entry["last_failure"] = ""
+                    else:
+                        status_entry["last_failure"] = "health probe failed"
+                else:
+                    if status_entry.get("last_pid") and config.get("auto_restart") and not status_entry.get("manual_stop"):
+                        profiles = load_profiles()
+                        profile = None
+                        for p in profiles.get(agent_name, []):
+                            if p.label == label:
+                                profile = p
+                                break
+                        agent_path = next((p for p in list_agents() if p.name == agent_name), None)
+                        if profile and agent_path:
+                            try:
+                                item = start_process(agent_name, profile, agent_path)
+                            except Exception as exc:
+                                status_entry["status"] = "stopped"
+                                status_entry["last_failure"] = f"restart failed: {exc}"
+                            else:
+                                if item.get("pid"):
+                                    state["processes"].append(item)
+                                    save_state(state)
+                                    status_entry["restart_count"] = int(
+                                        status_entry.get("restart_count", 0)
+                                    ) + 1
+                                    status_entry["status"] = "running"
+                                    status_entry["last_pid"] = item.get("pid")
+                                    status_entry["last_check"] = now
+                                    status_entry["manual_stop"] = False
+                                    append_health_log(
+                                        f"Auto-restarted {agent_name}:{label}."
+                                    )
+                        else:
+                            status_entry["status"] = "stopped"
+                    else:
+                        status_entry["status"] = "stopped"
+                        status_entry["last_check"] = now
+
+            save_health_state(health_state)
+
+    def mark_manual_stop(self, agent_name: str, label: str) -> None:
+        with self._lock:
+            state = load_health_state()
+            entry = state["profiles"].setdefault(
+                profile_key(agent_name, label),
+                {"restart_count": 0},
+            )
+            entry["manual_stop"] = True
+            save_health_state(state)
+
+    def clear_manual_stop(self, agent_name: str, label: str) -> None:
+        with self._lock:
+            state = load_health_state()
+            entry = state["profiles"].setdefault(
+                profile_key(agent_name, label),
+                {"restart_count": 0},
+            )
+            entry["manual_stop"] = False
+            save_health_state(state)
+
+
+HEALTH_MANAGER = HealthManager()
+atexit.register(HEALTH_MANAGER.stop)
 
 
 def open_streamlit_tab(port: int) -> None:
@@ -1035,6 +1352,7 @@ def install_requirements(agent_path: Path) -> tuple[bool, str]:
 
 st.set_page_config(page_title="Agentica", page_icon="🤖", layout="wide")
 TRIGGER_MANAGER.ensure_started()
+HEALTH_MANAGER.ensure_started()
 
 st.markdown(
     """
@@ -1269,6 +1587,21 @@ with st.sidebar:
         save_settings(settings)
         st.success("Saved settings.json")
         st.rerun()
+    with st.expander("Emergency controls", expanded=False):
+        st.caption("Stop stray processes by port.")
+        force_port = st.number_input(
+            "Port",
+            min_value=1,
+            max_value=65535,
+            value=8510,
+            key="force-stop-port",
+        )
+        if st.button("Stop process on port", key="force-stop-port-btn"):
+            stopped = stop_processes_by_port(int(force_port))
+            if stopped:
+                st.success(f"Stop signal sent for port {force_port}.")
+            else:
+                st.warning("No process found on that port.")
 
 hero_left, hero_right = st.columns([0.8, 0.2])
 with hero_right:
@@ -1511,6 +1844,7 @@ with right:
                     if item.get("pid") is None:
                         st.error(f"{profile.label} not started. Check log for details.")
                         continue
+                    HEALTH_MANAGER.clear_manual_stop(selected_agent.name, profile.label)
                     new_items.append(item)
                     if profile.streamlit_port:
                         open_streamlit_tab(profile.streamlit_port)
@@ -1522,18 +1856,90 @@ with right:
                     st.warning("No processes started. See launch logs below.")
                 st.rerun()
 
-            st.markdown("#### Running agents")
-            if st.button("Refresh status"):
-                refresh_state(load_state())
-                st.rerun()
-            running = refresh_state(load_state()).get("processes", [])
-            if not running:
-                st.info("No agents running.")
-            else:
-                for item in running:
-                    log_path = Path(item["log_path"])
-                    title = f"{item['agent']} · {item['label']}"
-                    with st.expander(title, expanded=False):
+            st.markdown("#### Health checks")
+            health_config = load_health_config()
+            health_state = load_health_state()
+            for profile in profiles:
+                key = profile_key(selected_agent.name, profile.label)
+                config = health_config.get(key, {})
+                if not config:
+                    probe_type = "http" if profile.streamlit_port else "disabled"
+                    config = {
+                        "probe_type": probe_type,
+                        "port": profile.streamlit_port,
+                        "probe_command": "",
+                        "auto_restart": False,
+                    }
+                    health_config[key] = config
+                    save_health_config(health_config)
+                status = health_state.get("profiles", {}).get(key, {})
+                with st.expander(f"{profile.label} health", expanded=False):
+                    st.markdown(
+                        f"**Status:** {status.get('status', 'unknown')} · "
+                        f"**Restarts:** {status.get('restart_count', 0)}"
+                    )
+                    probe_type = st.selectbox(
+                        "Probe type",
+                        ["http", "command", "disabled"],
+                        index=["http", "command", "disabled"].index(config.get("probe_type", "disabled")),
+                        key=f"probe-type-{key}",
+                    )
+                    config["probe_type"] = probe_type
+                    if probe_type == "http":
+                        port_val = config.get("port") or profile.streamlit_port or 0
+                        port_val = st.number_input(
+                            "HTTP port",
+                            min_value=0,
+                            max_value=65535,
+                            value=int(port_val),
+                            key=f"probe-port-{key}",
+                        )
+                        config["port"] = int(port_val)
+                    elif probe_type == "command":
+                        cmd_val = st.text_input(
+                            "Probe command",
+                            value=config.get("probe_command", ""),
+                            key=f"probe-cmd-{key}",
+                            placeholder="python3 health_check.py",
+                        )
+                        config["probe_command"] = cmd_val
+                    auto_restart = st.toggle(
+                        "Auto-restart on crash",
+                        value=bool(config.get("auto_restart", False)),
+                        key=f"auto-restart-{key}",
+                    )
+                    config["auto_restart"] = bool(auto_restart)
+                    health_config[key] = config
+            save_health_config(health_config)
+
+        st.markdown("#### Running agents")
+        if st.button("Refresh status"):
+            refresh_state(load_state())
+            st.rerun()
+        running = refresh_state(load_state()).get("processes", [])
+        if not running:
+            st.info("No agents running.")
+        else:
+            for item in running:
+                log_path = Path(item["log_path"])
+                title = f"{item['agent']} · {item['label']}"
+                with st.expander(title, expanded=False):
+                        key = profile_key(item["agent"], item["label"])
+                        health_state = load_health_state()
+                        health = health_state.get("profiles", {}).get(key, {})
+                        uptime = time.time() - item["started_at"]
+                        last_log_time = health.get("last_log_time")
+                        last_log_display = (
+                            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_log_time))
+                            if last_log_time
+                            else "n/a"
+                        )
+                        st.markdown(
+                            f"**Status:** {health.get('status', 'unknown')} · "
+                            f"**Uptime:** {int(uptime)}s · "
+                            f"**Last log line:** {last_log_display} · "
+                            f"**Restarts:** {health.get('restart_count', 0)}"
+                        )
                         st.markdown(
                             f"**PID:** {item['pid']} · **Command:** `{item['command']}`"
                         )
@@ -1548,6 +1954,7 @@ with right:
                             key=f"stop-{item['pid']}",
                         ):
                             stop_process(item["pid"], item.get("pgid"))
+                            HEALTH_MANAGER.mark_manual_stop(item["agent"], item["label"])
                             state = load_state()
                             state["processes"] = [
                                 p for p in state.get("processes", [])
@@ -1557,6 +1964,27 @@ with right:
                             refresh_state(state)
                             st.success("Stop signal sent.")
                             st.rerun()
+                        if st.button(
+                            f"Restart {item['agent']} {item['label']}",
+                            key=f"restart-{item['pid']}",
+                        ):
+                            profiles = load_profiles().get(item["agent"], [])
+                            profile = next((p for p in profiles if p.label == item["label"]), None)
+                            if profile:
+                                restarted = restart_profile_process(item["agent"], profile, Path(item["cwd"]))
+                                if restarted:
+                                    state = load_health_state()
+                                    entry = state["profiles"].setdefault(
+                                        profile_key(item["agent"], item["label"]),
+                                        {"restart_count": 0},
+                                    )
+                                    entry["restart_count"] = int(entry.get("restart_count", 0)) + 1
+                                    entry["manual_stop"] = False
+                                    save_health_state(state)
+                                    st.success("Restarted.")
+                                    st.rerun()
+                                else:
+                                    st.error("Restart failed. Check logs.")
                         log_tail = tail_log(log_path)
                         if log_tail:
                             st.text_area(
