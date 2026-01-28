@@ -14,6 +14,10 @@ import uuid
 import fnmatch
 import hashlib
 import hmac
+import zipfile
+import tempfile
+import shutil
+import urllib.request
 from datetime import datetime
 from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -39,6 +43,9 @@ TRIGGER_LOG_PATH = LOG_DIR / "agent_scheduler.log"
 HEALTH_CONFIG_PATH = CONFIG_DIR / "agent_health.json"
 HEALTH_STATE_PATH = Path("logs/agent_health_state.json")
 HEALTH_LOG_PATH = LOG_DIR / "agent_health.log"
+METADATA_PATH = CONFIG_DIR / "agent_metadata.json"
+REGISTRY_DIR = APP_ROOT / "registry"
+REGISTRY_INDEX_PATH = REGISTRY_DIR / "index.json"
 BUILDER_PORT = 8610
 BUILDER_STATE_PATH = Path("logs/agent_builder_state.json")
 WEBHOOK_PORT = 8625
@@ -202,6 +209,38 @@ def append_health_log(message: str) -> None:
     HEALTH_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with HEALTH_LOG_PATH.open("a", encoding="utf-8") as handle:
         handle.write(line)
+
+
+def load_metadata() -> dict:
+    if not METADATA_PATH.exists():
+        return {}
+    try:
+        data = json.loads(METADATA_PATH.read_text())
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_metadata(data: dict) -> None:
+    METADATA_PATH.write_text(json.dumps(data, indent=2))
+
+
+def load_registry_index() -> dict:
+    if not REGISTRY_INDEX_PATH.exists():
+        return {"bundles": []}
+    try:
+        data = json.loads(REGISTRY_INDEX_PATH.read_text())
+    except json.JSONDecodeError:
+        return {"bundles": []}
+    if not isinstance(data, dict):
+        return {"bundles": []}
+    data.setdefault("bundles", [])
+    return data
+
+
+def save_registry_index(data: dict) -> None:
+    REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
+    REGISTRY_INDEX_PATH.write_text(json.dumps(data, indent=2))
 
 
 def load_trigger_state() -> dict:
@@ -572,6 +611,186 @@ def run_probe_command(agent_path: Path, command: str, timeout: int = 10) -> bool
         return False
 
 
+def build_manifest(agent_name: str, agent_path: Path) -> dict:
+    metadata = load_metadata().get(agent_name, {})
+    requirements_path = agent_path / "requirements.txt"
+    requirements = []
+    if requirements_path.exists():
+        requirements = [
+            line.strip()
+            for line in requirements_path.read_text(errors="ignore").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+    profiles = [
+        {
+            "label": profile.label,
+            "command": profile.command,
+            "streamlit_port": profile.streamlit_port,
+        }
+        for profile in load_profiles().get(agent_name, [])
+    ]
+    return {
+        "name": agent_name,
+        "version": metadata.get("version", "0.1.0"),
+        "tags": metadata.get("tags", []),
+        "description": metadata.get("description", ""),
+        "requirements": requirements,
+        "profiles": profiles,
+    }
+
+
+def safe_extract_zip(zip_path: Path, dest: Path) -> None:
+    with zipfile.ZipFile(zip_path, "r") as bundle:
+        for member in bundle.infolist():
+            target = (dest / member.filename).resolve()
+            if dest.resolve() not in target.parents and target != dest.resolve():
+                raise ValueError("Unsafe path in bundle.")
+        bundle.extractall(dest)
+
+
+def export_agent_bundle(agent_name: str, agent_path: Path) -> Path:
+    exports_dir = APP_ROOT / "exports"
+    exports_dir.mkdir(parents=True, exist_ok=True)
+    manifest = build_manifest(agent_name, agent_path)
+    bundle_name = f"{agent_name}_v{manifest['version']}.agentica.zip"
+    bundle_path = exports_dir / bundle_name
+    with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        bundle.writestr("agentica_manifest.json", json.dumps(manifest, indent=2))
+        for root, dirs, files in os.walk(agent_path):
+            dirs[:] = [d for d in dirs if d not in {".venv", "__pycache__", ".git"}]
+            for filename in files:
+                if filename.endswith(".pyc"):
+                    continue
+                path = Path(root) / filename
+                rel = path.relative_to(agent_path)
+                bundle.write(path, arcname=str(Path("agent") / rel))
+    return bundle_path
+
+
+def import_agent_bundle(bundle_bytes: bytes, overwrite: bool) -> tuple[bool, str]:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bundle_path = Path(tmpdir) / "bundle.zip"
+        bundle_path.write_bytes(bundle_bytes)
+        extract_path = Path(tmpdir) / "bundle"
+        extract_path.mkdir()
+        safe_extract_zip(bundle_path, extract_path)
+        manifest_path = extract_path / "agentica_manifest.json"
+        if not manifest_path.exists():
+            return False, "Missing agentica_manifest.json in bundle."
+        manifest = json.loads(manifest_path.read_text())
+        agent_name = manifest.get("name")
+        if not agent_name:
+            return False, "Manifest missing agent name."
+        agent_folder = extract_path / "agent"
+        if not agent_folder.exists():
+            return False, "Bundle missing agent folder."
+        target = AGENTS_ROOT / agent_name
+        if target.exists():
+            if not overwrite:
+                return False, "Agent folder already exists."
+            shutil.rmtree(target)
+        shutil.copytree(agent_folder, target)
+
+        profiles = load_profiles()
+        if manifest.get("profiles"):
+            profiles[agent_name] = [
+                RunProfile(
+                    item.get("label"),
+                    item.get("command"),
+                    item.get("streamlit_port"),
+                )
+                for item in manifest.get("profiles", [])
+                if item.get("label") and item.get("command")
+            ]
+            save_profiles(profiles)
+
+        metadata = load_metadata()
+        metadata[agent_name] = {
+            "version": manifest.get("version", "0.1.0"),
+            "tags": manifest.get("tags", []),
+            "description": manifest.get("description", ""),
+        }
+        save_metadata(metadata)
+        return True, f"Imported {agent_name}."
+
+
+def publish_to_registry(bundle_path: Path) -> None:
+    REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
+    target = REGISTRY_DIR / bundle_path.name
+    shutil.copy2(bundle_path, target)
+    index = load_registry_index()
+    try:
+        with zipfile.ZipFile(bundle_path, "r") as bundle:
+            manifest = json.loads(bundle.read("agentica_manifest.json"))
+    except Exception:
+        manifest = {}
+    index["bundles"].append(
+        {
+            "bundle": target.name,
+            "name": manifest.get("name", ""),
+            "version": manifest.get("version", "0.1.0"),
+            "tags": manifest.get("tags", []),
+        }
+    )
+    save_registry_index(index)
+
+
+def publish_to_remote_registry(bundle_path: Path, endpoint: str, api_key: str) -> tuple[bool, str]:
+    if not endpoint.strip():
+        return False, "Missing registry endpoint."
+    try:
+        with open(bundle_path, "rb") as handle:
+            bundle_data = handle.read()
+        url = endpoint.rstrip("/") + "/upload"
+        headers = {
+            "X-API-Key": api_key,
+            "Content-Type": "application/zip",
+        }
+        req = urllib.request.Request(url, data=bundle_data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            if 200 <= resp.status < 300:
+                return True, "Published to remote registry."
+            return False, f"Registry returned {resp.status}."
+    except Exception as exc:
+        return False, f"Registry error: {exc}"
+
+
+def publish_to_github(agent_path: Path, repo_url: str, branch: str) -> tuple[bool, str]:
+    return publish_to_github_with_credentials(agent_path, repo_url, branch, None, None)
+
+
+def publish_to_github_with_credentials(
+    agent_path: Path,
+    repo_url: str,
+    branch: str,
+    username: str | None,
+    token: str | None,
+) -> tuple[bool, str]:
+    git_dir = agent_path / ".git"
+    repo = repo_url.strip()
+    if username and token and repo.startswith("https://"):
+        auth_prefix = f"https://{username}:{token}@"
+        repo = repo.replace("https://", auth_prefix, 1)
+    try:
+        if not git_dir.exists():
+            subprocess.run(["git", "init"], cwd=agent_path, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "add", "."], cwd=agent_path, check=True, capture_output=True, text=True)
+        subprocess.run(
+            ["git", "commit", "-m", "Initial commit"],
+            cwd=agent_path,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(["git", "branch", "-M", branch], cwd=agent_path, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "remote", "remove", "origin"], cwd=agent_path, check=False, capture_output=True, text=True)
+        subprocess.run(["git", "remote", "add", "origin", repo], cwd=agent_path, check=True, capture_output=True, text=True)
+        result = subprocess.run(["git", "push", "-u", "origin", branch], cwd=agent_path, check=False, capture_output=True, text=True)
+        if result.returncode != 0:
+            return False, result.stderr.strip() or "Git push failed."
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        return False, f"Git error: {exc}"
+    return True, "Published to GitHub."
 def restart_profile_process(agent_name: str, profile: RunProfile, agent_path: Path) -> dict | None:
     state = load_state()
     stopped = False
@@ -1451,6 +1670,10 @@ st.markdown(
         background: var(--accent) !important;
         color: #1a1a1a !important;
     }
+    [data-testid="stDownloadButton"] button {
+        background: var(--accent) !important;
+        color: #1a1a1a !important;
+    }
     [data-testid="baseButton-secondary"] {
         background: var(--card-2) !important;
         color: var(--text) !important;
@@ -1533,6 +1756,12 @@ st.markdown(
         color: var(--text);
         border-color: var(--accent);
     }
+    [data-testid="stSidebar"] [data-testid="stWidgetLabel"] p,
+    [data-testid="stSidebar"] [data-testid="stWidgetLabel"] span,
+    [data-testid="stSidebar"] [data-testid="stWidgetLabel"] div,
+    [data-testid="stSidebar"] [data-testid="stWidgetLabel"] * {
+        color: #111111 !important;
+    }
     [data-testid="stWidgetLabel"] p,
     [data-testid="stWidgetLabel"] span,
     [data-testid="stWidgetLabel"] div,
@@ -1587,6 +1816,10 @@ with st.sidebar:
         save_settings(settings)
         st.success("Saved settings.json")
         st.rerun()
+    with st.expander("GitHub credentials", expanded=False):
+        st.caption("Used only for publishing to GitHub.")
+        st.text_input("GitHub username", key="github-username")
+        st.text_input("GitHub token", key="github-token", type="password")
     with st.expander("Emergency controls", expanded=False):
         st.caption("Stop stray processes by port.")
         force_port = st.number_input(
@@ -1653,8 +1886,8 @@ with right:
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
-    overview_tab, files_tab, env_tab, setup_tab, run_tab, automation_tab = st.tabs(
-        ["Overview", "Files", "Environments", "Setup", "Run & Monitor", "Automation"]
+    overview_tab, files_tab, env_tab, setup_tab, run_tab, automation_tab, marketplace_tab = st.tabs(
+        ["Overview", "Files", "Environments", "Setup", "Run & Monitor", "Automation", "Marketplace"]
     )
 
     with overview_tab:
@@ -2168,4 +2401,125 @@ with right:
                 value=tail_log(TRIGGER_LOG_PATH, max_lines=120),
                 height=220,
             )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    with marketplace_tab:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown("#### Agent marketplace / registry")
+
+        metadata = load_metadata()
+        current_meta = metadata.get(selected_agent.name, {})
+
+        version = st.text_input(
+            "Version",
+            value=current_meta.get("version", "0.1.0"),
+            key=f"meta-version-{selected_agent.name}",
+        )
+        tags_raw = st.text_input(
+            "Tags (comma-separated)",
+            value=", ".join(current_meta.get("tags", [])),
+            key=f"meta-tags-{selected_agent.name}",
+        )
+        description = st.text_area(
+            "Description",
+            value=current_meta.get("description", ""),
+            key=f"meta-desc-{selected_agent.name}",
+            height=100,
+        )
+        if st.button("Save metadata", key=f"save-meta-{selected_agent.name}"):
+            tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
+            metadata[selected_agent.name] = {
+                "version": version.strip() or "0.1.0",
+                "tags": tags,
+                "description": description.strip(),
+            }
+            save_metadata(metadata)
+            st.success("Metadata saved.")
+
+        st.markdown("#### Export bundle")
+        if st.button("Build bundle", key=f"build-bundle-{selected_agent.name}"):
+            bundle_path = export_agent_bundle(selected_agent.name, selected_agent)
+            st.session_state[f"bundle-path-{selected_agent.name}"] = str(bundle_path)
+            st.success(f"Bundle created: {bundle_path.name}")
+
+        bundle_path_str = st.session_state.get(f"bundle-path-{selected_agent.name}")
+        if bundle_path_str:
+            bundle_path = Path(bundle_path_str)
+            if bundle_path.exists():
+                st.download_button(
+                    "Download bundle",
+                    data=bundle_path.read_bytes(),
+                    file_name=bundle_path.name,
+                    mime="application/zip",
+                    key=f"download-bundle-{selected_agent.name}",
+                )
+                if st.button("Publish to internal registry", key=f"publish-registry-{selected_agent.name}"):
+                    publish_to_registry(bundle_path)
+                    st.success("Published to internal registry.")
+                st.markdown("#### Publish to remote registry")
+                registry_url = st.text_input(
+                    "Registry endpoint",
+                    value="",
+                    key=f"registry-url-{selected_agent.name}",
+                    placeholder="https://registry.example.com",
+                )
+                registry_key = st.text_input(
+                    "Registry API key",
+                    value="",
+                    key=f"registry-key-{selected_agent.name}",
+                    type="password",
+                )
+                if st.button("Publish to remote", key=f"publish-remote-{selected_agent.name}"):
+                    ok, message = publish_to_remote_registry(bundle_path, registry_url, registry_key)
+                    if ok:
+                        st.success(message)
+                    else:
+                        st.error(message)
+
+        st.markdown("#### Publish to GitHub")
+        repo_url = st.text_input("Repo URL", value="", key=f"repo-url-{selected_agent.name}")
+        branch = st.text_input("Branch", value="main", key=f"repo-branch-{selected_agent.name}")
+        if st.button("Publish", key=f"publish-github-{selected_agent.name}"):
+            if not repo_url.strip():
+                st.error("Provide a repo URL.")
+            else:
+                username = st.session_state.get("github-username")
+                token = st.session_state.get("github-token")
+                ok, message = publish_to_github_with_credentials(
+                    selected_agent,
+                    repo_url.strip(),
+                    branch.strip() or "main",
+                    username,
+                    token,
+                )
+                if ok:
+                    st.success(message)
+                else:
+                    st.error(message)
+
+        st.markdown("#### Import bundle")
+        uploaded = st.file_uploader("Agent bundle (.zip)", type=["zip"])
+        overwrite = st.checkbox("Overwrite if agent exists", value=False, key="import-overwrite")
+        if st.button("Import bundle"):
+            if not uploaded:
+                st.error("Upload a bundle first.")
+            else:
+                ok, message = import_agent_bundle(uploaded.getvalue(), overwrite)
+                if ok:
+                    st.success(message)
+                    st.rerun()
+                else:
+                    st.error(message)
+
+        st.markdown("#### Internal registry")
+        index = load_registry_index()
+        if not index.get("bundles"):
+            st.caption("No bundles published yet.")
+        else:
+            for item in index.get("bundles", []):
+                st.markdown(
+                    f"- **{item.get('name','')}** v{item.get('version','')} · "
+                    f"tags: {', '.join(item.get('tags', []))} · "
+                    f"bundle: `{item.get('bundle','')}`"
+                )
         st.markdown("</div>", unsafe_allow_html=True)

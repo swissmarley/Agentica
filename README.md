@@ -62,13 +62,14 @@ Click **Create Agent** in the top right to launch **Agentica Builder**.
 ## 🧠 Agentica Builder Modes
 
 ### 🧩 Templates & Starter Kits
-- RAG Agent
-- Web Scraper Agent
-- Ops Monitor Agent
-- Report Generator Agent
+- Hiring Agent
+- Multi Agent
+- News Scraper Agent
+- Security Agent
+- WhatsApp Supportbot
 - One-click create with run profiles + README
 - Templates live under `templates/` and can be customized.
-- Templates include LangChain/CrewAI + Streamlit UI and async pipelines.
+ 
 
 ### 🛠 Manual Mode
 - Enter agent name
@@ -87,6 +88,17 @@ Click **Create Agent** in the top right to launch **Agentica Builder**.
 - Define run profiles
 
 > API Key: If `OPENAI_API_KEY` exists in `.env`, it auto-fills in the builder.
+
+---
+
+## 🛍️ Agent Marketplace / Registry
+
+Agentica can export/import agents as bundles:
+- Bundles include metadata (name, version, tags, requirements) and run profiles
+- Import bundles to create agents from files + manifest
+- Publish bundles to an internal registry (`registry/`)
+
+Marketplace controls live in the **Marketplace** tab per agent.
 
 ---
 
@@ -224,6 +236,8 @@ pip install -r requirements.txt
 ---
 
 Agentica is built to scale with your agents. Happy building! 🚀
+
+---
 
 ## License
 
