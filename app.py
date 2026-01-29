@@ -155,19 +155,43 @@ AGENTS_ROOT = get_agents_root()
 ensure_agents_root(AGENTS_ROOT)
 RUN_PROFILES = load_profiles()
 
+# Global lock for thread-safe state file operations
+_STATE_LOCK = threading.Lock()
+
 
 def load_state() -> dict:
-    if not STATE_PATH.exists():
-        return {"processes": []}
-    try:
-        data = json.loads(STATE_PATH.read_text())
-    except json.JSONDecodeError:
-        return {"processes": []}
-    return data if isinstance(data, dict) else {"processes": []}
+    with _STATE_LOCK:
+        if not STATE_PATH.exists():
+            return {"processes": []}
+        try:
+            data = json.loads(STATE_PATH.read_text())
+        except json.JSONDecodeError:
+            return {"processes": []}
+        return data if isinstance(data, dict) else {"processes": []}
 
 
 def save_state(state: dict) -> None:
-    STATE_PATH.write_text(json.dumps(state, indent=2))
+    with _STATE_LOCK:
+        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        STATE_PATH.write_text(json.dumps(state, indent=2))
+
+
+def atomic_state_update(update_fn) -> dict:
+    """Atomically update state with a function that takes state and returns modified state."""
+    with _STATE_LOCK:
+        if not STATE_PATH.exists():
+            state = {"processes": []}
+        else:
+            try:
+                state = json.loads(STATE_PATH.read_text())
+            except json.JSONDecodeError:
+                state = {"processes": []}
+        if not isinstance(state, dict):
+            state = {"processes": []}
+        state = update_fn(state)
+        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        STATE_PATH.write_text(json.dumps(state, indent=2))
+        return state
 
 
 def load_triggers() -> dict[str, list[dict]]:
@@ -393,6 +417,25 @@ def append_trigger_log(message: str) -> None:
 
 
 def pid_is_alive(pid: int) -> bool:
+    if pid is None:
+        return False
+    if platform.system() == "Windows":
+        try:
+            kwargs = {"capture_output": True, "text": True, "timeout": 5}
+            if hasattr(subprocess, "CREATE_NO_WINDOW"):
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                **kwargs,
+            )
+            # tasklist returns "INFO: No tasks are running..." when PID not found
+            # Check if the PID appears as a number in the output (not just in error message)
+            output = result.stdout
+            if "INFO:" in output or "No tasks" in output.lower():
+                return False
+            return str(pid) in output
+        except (subprocess.SubprocessError, subprocess.TimeoutExpired, OSError):
+            return False
     try:
         os.kill(pid, 0)
     except OSError:
@@ -400,7 +443,9 @@ def pid_is_alive(pid: int) -> bool:
     return True
 
 
-def pgid_is_alive(pgid: int) -> bool:
+def pgid_is_alive(pgid: int | None) -> bool:
+    if pgid is None:
+        return False
     if platform.system() == "Windows":
         return False
     try:
@@ -410,17 +455,32 @@ def pgid_is_alive(pgid: int) -> bool:
     return True
 
 
+def is_process_running(item: dict) -> bool:
+    """Check if a process is running using PID and port fallback."""
+    pid = item.get("pid")
+    pgid = item.get("pgid")
+    port = item.get("streamlit_port")
+
+    # Check by process group first (Unix)
+    if pgid and pgid_is_alive(pgid):
+        return True
+
+    # Check by PID
+    if pid and pid_is_alive(pid):
+        return True
+
+    # Fallback: check if port is in use for Streamlit processes
+    if port and port_is_open(int(port)):
+        return True
+
+    return False
+
+
 def refresh_state(state: dict) -> dict:
+    """Refresh state by checking which processes are still running."""
     processes = []
     for item in state.get("processes", []):
-        pid = item.get("pid")
-        pgid = item.get("pgid")
-        alive = False
-        if pgid:
-            alive = pgid_is_alive(pgid)
-        elif pid:
-            alive = pid_is_alive(pid)
-        if alive:
+        if is_process_running(item):
             processes.append(item)
     state["processes"] = processes
     save_state(state)
@@ -539,26 +599,39 @@ def start_process(agent: str, profile: RunProfile, agent_path: Path) -> dict:
     }
 
 
-def stop_process(pid: int, pgid: int | None) -> None:
+def stop_process(pid: int, pgid: int | None) -> bool:
+    """Stop a process and return True if successfully stopped."""
+    if pid is None:
+        return True
     try:
         if platform.system() == "Windows":
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(pid)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            return
+            kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "timeout": 10}
+            if hasattr(subprocess, "CREATE_NO_WINDOW"):
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    **kwargs,
+                )
+            except subprocess.TimeoutExpired:
+                pass  # Continue to check if process stopped anyway
+            # Wait and verify process stopped on Windows (shorter wait)
+            for _ in range(15):
+                if not pid_is_alive(pid):
+                    return True
+                time.sleep(0.2)
+            return not pid_is_alive(pid)
         if pgid:
             os.killpg(pgid, signal.SIGTERM)
         else:
             os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
-        return
+        return True
 
     for _ in range(25):
         alive = pgid_is_alive(pgid) if pgid else pid_is_alive(pid)
         if not alive:
-            return
+            return True
         time.sleep(0.2)
     try:
         if pgid:
@@ -566,7 +639,8 @@ def stop_process(pid: int, pgid: int | None) -> None:
         else:
             os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
-        return
+        return True
+    return not (pgid_is_alive(pgid) if pgid else pid_is_alive(pid))
 
 
 def tail_log(path: Path, max_lines: int = 80) -> str:
@@ -619,14 +693,16 @@ def stop_processes_by_port(port: int) -> bool:
     for pid in pids:
         try:
             if platform.system() == "Windows":
+                kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+                if hasattr(subprocess, "CREATE_NO_WINDOW"):
+                    kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
                 subprocess.run(
                     ["taskkill", "/F", "/T", "/PID", str(pid)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    **kwargs,
                 )
             else:
                 os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
+        except (ProcessLookupError, OSError):
             continue
     return True
 
@@ -635,19 +711,32 @@ def stop_item_process(item: dict) -> tuple[bool, str]:
     pid = item.get("pid")
     pgid = item.get("pgid")
     port = item.get("streamlit_port")
+
+    # Try to stop by PID first
     if pid:
-        stop_process(pid, pgid)
+        stopped = stop_process(pid, pgid)
+        if stopped:
+            return True, "Stopped."
+
+    # Check if still alive after PID-based stop attempt
     alive = False
     if pgid:
         alive = pgid_is_alive(pgid)
     elif pid:
         alive = pid_is_alive(pid)
+
+    # Only use port-based stop as last resort fallback when PID stop failed
     if alive and port:
-        stop_processes_by_port(int(port))
-        time.sleep(0.4)
-        alive = pgid_is_alive(pgid) if pgid else pid_is_alive(pid)
-        if alive is False:
-            return True, "Stopped via port."
+        port_in_use = port_is_open(int(port))
+        if port_in_use:
+            stop_processes_by_port(int(port))
+            time.sleep(0.5)
+            # Re-check if process stopped
+            pid_alive = pid_is_alive(pid) if pid else False
+            if not pid_alive:
+                return True, "Stopped via port fallback."
+            return False, "Process still running."
+
     if alive:
         return False, "Process still running."
     return True, "Stopped."
@@ -1152,28 +1241,37 @@ def publish_to_github_with_credentials(
         return False, f"Git error: {exc}"
     return True, "Published to GitHub."
 def restart_profile_process(agent_name: str, profile: RunProfile, agent_path: Path) -> dict | None:
+    # First, stop and remove the old process atomically
     state = load_state()
     stopped = False
     for item in list(state.get("processes", [])):
         if item.get("agent") == agent_name and item.get("label") == profile.label:
             stop_process(item["pid"], item.get("pgid"))
-            state["processes"] = [
-                p for p in state.get("processes", [])
+            stopped = True
+
+    if stopped:
+        # Atomically remove the old process
+        def remove_old_process(s):
+            s["processes"] = [
+                p for p in s.get("processes", [])
                 if not (p.get("agent") == agent_name and p.get("label") == profile.label)
             ]
-            stopped = True
-    save_state(state)
-    if stopped:
+            return s
+        atomic_state_update(remove_old_process)
         time.sleep(0.3)
+
     try:
         item = start_process(agent_name, profile, agent_path)
     except Exception:
         return None
     if item.get("pid") is None:
         return None
-    state = load_state()
-    state.setdefault("processes", []).append(item)
-    save_state(state)
+
+    # Atomically add the new process
+    def add_new_process(s):
+        s.setdefault("processes", []).append(item)
+        return s
+    atomic_state_update(add_new_process)
     return item
 
 
@@ -1398,14 +1496,18 @@ class TriggerManager:
             append_trigger_log(f"Trigger skipped for {agent_name}: missing profile label.")
             return
         with self._lock:
-            state = refresh_state(load_state())
+            # Check if already running without calling refresh_state
+            # (refresh_state can incorrectly remove processes during timing issues)
+            state = load_state()
             if rule.get("skip_if_running", True):
                 for item in state.get("processes", []):
                     if item.get("agent") == agent_name and item.get("label") == profile_label:
-                        append_trigger_log(
-                            f"Skipped trigger for {agent_name}:{profile_label} (already running)."
-                        )
-                        return
+                        # Double-check the process is actually running
+                        if is_process_running(item):
+                            append_trigger_log(
+                                f"Skipped trigger for {agent_name}:{profile_label} (already running)."
+                            )
+                            return
             profiles = load_profiles()
             profile = None
             for p in profiles.get(agent_name, []):
@@ -1433,8 +1535,13 @@ class TriggerManager:
                     f"Trigger failed for {agent_name}:{profile_label} (process not started)."
                 )
                 return
-            state["processes"].append(item)
-            save_state(state)
+
+            # Atomically add the new process to state
+            def add_process(s):
+                s.setdefault("processes", []).append(item)
+                return s
+            atomic_state_update(add_process)
+
             HEALTH_MANAGER.clear_manual_stop(agent_name, profile_label)
             self._state["last_run"][rule.get("id")] = time.time()
             save_trigger_state(self._state)
@@ -1568,8 +1675,11 @@ class HealthManager:
                                 status_entry["last_failure"] = f"restart failed: {exc}"
                             else:
                                 if item.get("pid"):
-                                    state["processes"].append(item)
-                                    save_state(state)
+                                    # Atomically add the restarted process to state
+                                    def add_restarted_process(s):
+                                        s.setdefault("processes", []).append(item)
+                                        return s
+                                    atomic_state_update(add_restarted_process)
                                     status_entry["restart_count"] = int(
                                         status_entry.get("restart_count", 0)
                                     ) + 1
@@ -2444,9 +2554,12 @@ with right:
                     new_items.append(item)
                     if profile.streamlit_port:
                         open_streamlit_tab(profile.streamlit_port)
-                state["processes"].extend(new_items)
-                save_state(state)
                 if new_items:
+                    # Atomically add all new processes to state
+                    def add_processes(s):
+                        s.setdefault("processes", []).extend(new_items)
+                        return s
+                    atomic_state_update(add_processes)
                     st.success("Agent started.")
                 else:
                     st.warning("No processes started. See launch logs below.")
@@ -2552,13 +2665,15 @@ with right:
                             stopped, message = stop_item_process(item)
                             if stopped:
                                 HEALTH_MANAGER.mark_manual_stop(item["agent"], item["label"])
-                                state = load_state()
-                                state["processes"] = [
-                                    p for p in state.get("processes", [])
+                                # Load fresh state and remove ONLY the stopped process
+                                current_state = load_state()
+                                current_state["processes"] = [
+                                    p for p in current_state.get("processes", [])
                                     if p.get("pid") != item["pid"]
                                 ]
-                                save_state(state)
-                                refresh_state(state)
+                                save_state(current_state)
+                                # Don't call refresh_state here - it may incorrectly
+                                # remove other processes due to timing issues
                                 st.success(message)
                                 st.rerun()
                             else:
