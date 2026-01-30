@@ -20,6 +20,7 @@ import shutil
 import urllib.request
 import difflib
 import sqlite3
+import re
 from datetime import datetime
 from urllib.parse import urlparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -436,6 +437,9 @@ def pid_is_alive(pid: int) -> bool:
             return str(pid) in output
         except (subprocess.SubprocessError, subprocess.TimeoutExpired, OSError):
             return False
+    state, _start = read_proc_stat(pid)
+    if state == "Z":
+        return False
     try:
         os.kill(pid, 0)
     except OSError:
@@ -455,22 +459,136 @@ def pgid_is_alive(pgid: int | None) -> bool:
     return True
 
 
+def pid_start_time(pid: int) -> int | None:
+    if platform.system() == "Windows":
+        return None
+    _state, start = read_proc_stat(pid)
+    return start
+
+
+def read_proc_stat(pid: int) -> tuple[str | None, int | None]:
+    try:
+        data = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None, None
+    rparen = data.rfind(")")
+    if rparen == -1:
+        return None, None
+    rest = data[rparen + 2 :].split()
+    if len(rest) < 20:
+        return None, None
+    state = rest[0]
+    try:
+        start_time = int(rest[19])
+    except ValueError:
+        start_time = None
+    return state, start_time
+
+
+def read_proc_cmdline(pid: int) -> str | None:
+    if platform.system() == "Windows":
+        return None
+    try:
+        data = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+    if not data:
+        return None
+    return data.replace(b"\x00", b" ").decode("utf-8", errors="ignore").strip()
+
+
+def read_proc_cwd(pid: int) -> Path | None:
+    if platform.system() == "Windows":
+        return None
+    try:
+        return Path(os.readlink(f"/proc/{pid}/cwd"))
+    except OSError:
+        return None
+
+
+def extract_script_from_command(command: str) -> str | None:
+    try:
+        parts = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if not parts:
+        return None
+    if parts[0] == "streamlit" and len(parts) >= 3 and parts[1] == "run":
+        return parts[2]
+    if parts[0] in ("python", "python3") and len(parts) >= 2:
+        return parts[1]
+    return None
+
+
+def command_fingerprint_matches(command: str, cmdline: str) -> bool:
+    if not command or not cmdline:
+        return False
+    command_lower = command.lower()
+    cmdline_lower = cmdline.lower()
+    script = extract_script_from_command(command)
+    if script and script in cmdline:
+        return True
+    if "streamlit" in command_lower and "streamlit" in cmdline_lower:
+        return True
+    if "uvicorn" in command_lower and "uvicorn" in cmdline_lower:
+        return True
+    return False
+
+
+def port_matches_item(item: dict, port: int) -> bool:
+    agent_cwd_raw = item.get("cwd")
+    agent_cwd = Path(agent_cwd_raw) if agent_cwd_raw else None
+    any_inspected = False
+    for pid in find_pids_by_port(port):
+        if item.get("pid") == pid:
+            return True
+        cwd = read_proc_cwd(pid)
+        if cwd is not None:
+            any_inspected = True
+            if agent_cwd:
+                try:
+                    cwd.relative_to(agent_cwd)
+                except ValueError:
+                    pass
+                else:
+                    return True
+        cmdline = read_proc_cmdline(pid)
+        if cmdline is not None:
+            any_inspected = True
+            if command_fingerprint_matches(item.get("command", ""), cmdline):
+                return True
+    return False if any_inspected else True
+
+
 def is_process_running(item: dict) -> bool:
     """Check if a process is running using PID and port fallback."""
     pid = item.get("pid")
     pgid = item.get("pgid")
     port = item.get("streamlit_port")
+    expected_start = item.get("pid_start")
 
-    # Check by process group first (Unix)
+    # Prefer PID to avoid stale PGID matches after process exit/reuse.
+    if pid:
+        if expected_start is not None:
+            current_start = pid_start_time(pid)
+            if current_start is None or current_start != expected_start:
+                return False
+        if pid_is_alive(pid):
+            return True
+        if platform.system() == "Windows" and port and port_is_open(int(port)):
+            return True
+        if port and port_matches_item(item, int(port)):
+            return True
+        return False
+
+    # Check by process group (Unix) only when PID is unavailable.
     if pgid and pgid_is_alive(pgid):
         return True
 
-    # Check by PID
-    if pid and pid_is_alive(pid):
-        return True
-
     # Fallback: check if port is in use for Streamlit processes
-    if port and port_is_open(int(port)):
+    # Only rely on port check if no PID information available
+    # On Unix, ports may take time to release after process termination
+    if port and port_matches_item(item, int(port)):
         return True
 
     return False
@@ -672,11 +790,30 @@ def venv_python_path(agent_path: Path) -> Path:
         return agent_path / ".venv" / "Scripts" / "python.exe"
     return agent_path / ".venv" / "bin" / "python"
 
-def build_windows_command(profile: RunProfile, agent_path: Path) -> tuple[list[str] | None, str | None]:
+
+def normalize_streamlit_command(command: str, port: int) -> str:
+    port_str = str(port)
+    # Replace --server.port=XXXX
+    command = re.sub(r"--server\\.port=(\\d+)", f"--server.port={port_str}", command)
+    # Replace --server.port XXXX
+    command = re.sub(r"--server\\.port\\s+\\d+", f"--server.port {port_str}", command)
+    if "--server.port" not in command:
+        if "--server.headless" in command:
+            command = command.replace(
+                "--server.headless",
+                f"--server.port {port_str} --server.headless",
+                1,
+            )
+        else:
+            command = f"{command} --server.port {port_str}"
+    return command
+
+
+def build_windows_command(command: str, agent_path: Path) -> tuple[list[str] | None, str | None]:
     venv_python = venv_python_path(agent_path)
     if not venv_python.exists():
         return None, "Missing .venv\\Scripts\\python.exe. Create venv first."
-    command = profile.command.strip()
+    command = command.strip()
     if command.startswith("streamlit "):
         rest = shlex.split(command[len("streamlit "):].strip(), posix=False)
         return [str(venv_python), "-m", "streamlit", *rest], None
@@ -697,8 +834,11 @@ def start_process(agent: str, profile: RunProfile, agent_path: Path) -> dict:
     log_handle = open(log_path, "wb", buffering=0)
     log_handle.write(f"[agentica] Launching {profile.label}\n".encode("utf-8"))
     run_env = build_agent_env(agent)
+    command_to_run = profile.command.strip()
+    if profile.streamlit_port and (profile.label == "streamlit" or "streamlit" in command_to_run):
+        command_to_run = normalize_streamlit_command(command_to_run, profile.streamlit_port)
     if os.name == "nt" or platform.system() == "Windows":
-        command, error = build_windows_command(profile, agent_path)
+        command, error = build_windows_command(command_to_run, agent_path)
         if error:
             log_handle.write(f"[agentica] {error}\n".encode("utf-8"))
             log_handle.flush()
@@ -707,7 +847,7 @@ def start_process(agent: str, profile: RunProfile, agent_path: Path) -> dict:
                 "label": profile.label,
                 "pid": None,
                 "pgid": None,
-                "command": profile.command,
+                "command": command_to_run,
                 "streamlit_port": profile.streamlit_port,
                 "cwd": str(agent_path),
                 "log_path": str(log_path),
@@ -726,7 +866,7 @@ def start_process(agent: str, profile: RunProfile, agent_path: Path) -> dict:
         )
         pgid = None
     else:
-        command = f"source .venv/bin/activate && {profile.command}"
+        command = f"source .venv/bin/activate && exec {command_to_run}"
         log_handle.write(f"[agentica] Command: {command}\n".encode("utf-8"))
         process = subprocess.Popen(
             ["bash", "-lc", command],
@@ -745,7 +885,8 @@ def start_process(agent: str, profile: RunProfile, agent_path: Path) -> dict:
         "label": profile.label,
         "pid": process.pid,
         "pgid": pgid,
-        "command": profile.command,
+        "pid_start": pid_start_time(process.pid),
+        "command": command_to_run,
         "streamlit_port": profile.streamlit_port,
         "cwd": str(agent_path),
         "log_path": str(log_path),
@@ -865,19 +1006,34 @@ def stop_item_process(item: dict) -> tuple[bool, str]:
     pid = item.get("pid")
     pgid = item.get("pgid")
     port = item.get("streamlit_port")
+    expected_start = item.get("pid_start")
 
     # Try to stop by PID first
     if pid:
         stopped = stop_process(pid, pgid)
         if stopped:
+            # On Unix systems, give a brief moment for port to be released
+            if platform.system() != "Windows" and port:
+                time.sleep(0.3)
             return True, "Stopped."
 
     # Check if still alive after PID-based stop attempt
+    # Wait a bit longer on Unix for process cleanup
+    if platform.system() != "Windows":
+        time.sleep(0.5)
+
     alive = False
-    if pgid:
+    if pid:
+        if expected_start is not None:
+            current_start = pid_start_time(pid)
+            if current_start is None or current_start != expected_start:
+                alive = False
+            else:
+                alive = pid_is_alive(pid)
+        else:
+            alive = pid_is_alive(pid)
+    elif pgid:
         alive = pgid_is_alive(pgid)
-    elif pid:
-        alive = pid_is_alive(pid)
 
     # Only use port-based stop as last resort fallback when PID stop failed
     if alive and port:
@@ -890,6 +1046,12 @@ def stop_item_process(item: dict) -> tuple[bool, str]:
             if not pid_alive:
                 return True, "Stopped via port fallback."
             return False, "Process still running."
+
+    if not alive and port and (
+        (platform.system() == "Windows" and port_is_open(int(port)))
+        or port_matches_item(item, int(port))
+    ):
+        return False, "Process still running."
 
     if alive:
         return False, "Process still running."
@@ -3035,6 +3197,7 @@ with right:
                                 "Recent output",
                                 value=log_tail,
                                 height=220,
+                                key=f"log-tail-{item['agent']}-{item['label']}-{item['pid']}",
                             )
                         else:
                             st.markdown("No output yet.")
