@@ -7,8 +7,8 @@
       "profiles": [
         {
           "label": "streamlit",
-          "command": "streamlit run hiring_agent.py --server.port 8510 --server.headless true",
-          "streamlit_port": 8510
+          "command": "streamlit run agent.py --server.port 8510 --server.headless true",
+          "streamlit_port": 8551
         }
       ]
     },
@@ -20,7 +20,7 @@
         {
           "label": "streamlit",
           "command": "streamlit run app.py --server.port 8510 --server.headless true",
-          "streamlit_port": 8510
+          "streamlit_port": 8552
         },
         {
           "label": "backend",
@@ -37,7 +37,7 @@
         {
           "label": "streamlit",
           "command": "streamlit run app.py --server.port 8510 --server.headless true",
-          "streamlit_port": 8510
+          "streamlit_port": 8553
         }
       ]
     },
@@ -49,7 +49,7 @@
         {
           "label": "streamlit",
           "command": "streamlit run dashboard.py --server.port 8510 --server.headless true",
-          "streamlit_port": 8510
+          "streamlit_port": 8554
         },
         {
           "label": "bot",
@@ -71,7 +71,7 @@
         {
           "label": "streamlit",
           "command": "streamlit run dashboard.py --server.port 8510 --server.headless true",
-          "streamlit_port": 8510
+          "streamlit_port": 8555
         }
       ]
     }
