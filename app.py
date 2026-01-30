@@ -479,7 +479,14 @@ def is_process_running(item: dict) -> bool:
 def refresh_state(state: dict) -> dict:
     """Refresh state by checking which processes are still running."""
     processes = []
+    now = time.time()
     for item in state.get("processes", []):
+        # Give newly started processes a grace period (10 seconds)
+        # before checking if they're alive - they may still be initializing
+        started_at = item.get("started_at", 0)
+        if now - started_at < 10:
+            processes.append(item)
+            continue
         if is_process_running(item):
             processes.append(item)
     state["processes"] = processes
