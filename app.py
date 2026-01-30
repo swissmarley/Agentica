@@ -520,6 +520,153 @@ def list_files(agent_path: Path) -> list[Path]:
                 files.append(path)
     return sorted(files, key=lambda p: str(p).lower())
 
+
+def delete_agent(agent_name: str) -> tuple[bool, str]:
+    """Delete an agent folder and all associated settings."""
+    agent_path = AGENTS_ROOT / agent_name
+    if not agent_path.exists():
+        return False, "Agent folder not found."
+
+    # Check if agent has running processes
+    state = load_state()
+    running = [p for p in state.get("processes", []) if p.get("agent") == agent_name]
+    if running:
+        return False, "Agent has running processes. Stop them first."
+
+    try:
+        # Delete agent folder
+        import shutil
+        shutil.rmtree(agent_path)
+
+        # Clean up profiles
+        profiles = load_profiles()
+        if agent_name in profiles:
+            del profiles[agent_name]
+            save_profiles(profiles)
+
+        # Clean up triggers
+        triggers = load_triggers()
+        if agent_name in triggers:
+            del triggers[agent_name]
+            save_triggers(triggers)
+
+        # Clean up health config
+        health_config = load_health_config()
+        keys_to_remove = [k for k in health_config if k.startswith(f"{agent_name}::")]
+        for k in keys_to_remove:
+            del health_config[k]
+        save_health_config(health_config)
+
+        # Clean up health state
+        health_state = load_health_state()
+        keys_to_remove = [k for k in health_state.get("profiles", {}) if k.startswith(f"{agent_name}::")]
+        for k in keys_to_remove:
+            del health_state["profiles"][k]
+        save_health_state(health_state)
+
+        # Clean up secrets
+        delete_agent_secrets(agent_name)
+
+        # Clean up state (remove any stale process entries)
+        state["processes"] = [p for p in state.get("processes", []) if p.get("agent") != agent_name]
+        save_state(state)
+
+        return True, f"Agent '{agent_name}' deleted successfully."
+    except Exception as exc:
+        return False, f"Failed to delete agent: {exc}"
+
+
+def rename_agent(old_name: str, new_name: str) -> tuple[bool, str]:
+    """Rename an agent folder and update all associated settings."""
+    if not new_name or not new_name.strip():
+        return False, "New name cannot be empty."
+
+    new_name = new_name.strip()
+    if new_name == old_name:
+        return False, "New name is the same as old name."
+
+    # Validate new name (no special characters)
+    if not all(c.isalnum() or c in "-_" for c in new_name):
+        return False, "Name can only contain letters, numbers, hyphens, and underscores."
+
+    old_path = AGENTS_ROOT / old_name
+    new_path = AGENTS_ROOT / new_name
+
+    if not old_path.exists():
+        return False, "Agent folder not found."
+    if new_path.exists():
+        return False, f"An agent named '{new_name}' already exists."
+
+    # Check if agent has running processes
+    state = load_state()
+    running = [p for p in state.get("processes", []) if p.get("agent") == old_name]
+    if running:
+        return False, "Agent has running processes. Stop them first."
+
+    try:
+        # Rename folder
+        old_path.rename(new_path)
+
+        # Update profiles
+        profiles = load_profiles()
+        if old_name in profiles:
+            profiles[new_name] = profiles.pop(old_name)
+            save_profiles(profiles)
+
+        # Update triggers
+        triggers = load_triggers()
+        if old_name in triggers:
+            triggers[new_name] = triggers.pop(old_name)
+            save_triggers(triggers)
+
+        # Update health config
+        health_config = load_health_config()
+        keys_to_update = [k for k in health_config if k.startswith(f"{old_name}::")]
+        for old_key in keys_to_update:
+            new_key = old_key.replace(f"{old_name}::", f"{new_name}::", 1)
+            health_config[new_key] = health_config.pop(old_key)
+        save_health_config(health_config)
+
+        # Update health state
+        health_state = load_health_state()
+        keys_to_update = [k for k in health_state.get("profiles", {}) if k.startswith(f"{old_name}::")]
+        for old_key in keys_to_update:
+            new_key = old_key.replace(f"{old_name}::", f"{new_name}::", 1)
+            health_state["profiles"][new_key] = health_state["profiles"].pop(old_key)
+        save_health_state(health_state)
+
+        # Update secrets (rename in database)
+        rename_agent_secrets(old_name, new_name)
+
+        return True, f"Agent renamed to '{new_name}'."
+    except Exception as exc:
+        return False, f"Failed to rename agent: {exc}"
+
+
+def delete_agent_secrets(agent_name: str) -> None:
+    """Delete all secrets for an agent."""
+    try:
+        conn = sqlite3.connect(SECRETS_DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM secrets WHERE agent = ?", (agent_name,))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def rename_agent_secrets(old_name: str, new_name: str) -> None:
+    """Rename agent in secrets database."""
+    try:
+        conn = sqlite3.connect(SECRETS_DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE secrets SET agent = ? WHERE agent = ?", (new_name, old_name))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
 def venv_python_path(agent_path: Path) -> Path:
     if platform.system() == "Windows":
         return agent_path / ".venv" / "Scripts" / "python.exe"
@@ -2306,6 +2453,60 @@ with st.sidebar:
             else:
                 st.warning("No process found on that port.")
 
+    with st.expander("Manage Agents", expanded=False):
+        st.caption("Rename or delete existing agents.")
+        sidebar_agents = list_agents()
+        if not sidebar_agents:
+            st.info("No agents found.")
+        else:
+            agent_names_sidebar = [a.name for a in sidebar_agents]
+            selected_manage_agent = st.selectbox(
+                "Select agent",
+                agent_names_sidebar,
+                key="manage-agent-select",
+            )
+
+            # Rename section
+            st.markdown("**Rename Agent**")
+            new_agent_name = st.text_input(
+                "New name",
+                value="",
+                key="rename-agent-input",
+                placeholder="Enter new name...",
+            )
+            if st.button("Rename Agent", key="rename-agent-btn"):
+                if new_agent_name:
+                    success, msg = rename_agent(selected_manage_agent, new_agent_name)
+                    if success:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+                else:
+                    st.warning("Please enter a new name.")
+
+            st.markdown("---")
+
+            # Delete section
+            st.markdown("**Delete Agent**")
+            st.warning("⚠️ This will permanently delete the agent folder and all settings!")
+            delete_confirm_name = st.text_input(
+                f"Type '{selected_manage_agent}' to confirm deletion",
+                value="",
+                key="delete-agent-confirm",
+                placeholder="Type agent name to confirm...",
+            )
+            if st.button("Delete Agent", key="delete-agent-btn", type="primary"):
+                if delete_confirm_name == selected_manage_agent:
+                    success, msg = delete_agent(selected_manage_agent)
+                    if success:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+                else:
+                    st.error(f"Please type '{selected_manage_agent}' exactly to confirm deletion.")
+
 hero_left, hero_right = st.columns([0.8, 0.2])
 with hero_right:
     if st.button("Create Agent"):
@@ -2375,9 +2576,107 @@ with right:
     with files_tab:
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown("#### Browse & edit files")
+
+        # Add files section
+        add_files_col1, add_files_col2 = st.columns([0.5, 0.5])
+        with add_files_col1:
+            if st.button("➕ Create File", key="create-file-btn", use_container_width=True):
+                st.session_state.show_create_file = True
+                st.session_state.show_upload_file = False
+        with add_files_col2:
+            if st.button("📤 Upload File", key="upload-file-btn", use_container_width=True):
+                st.session_state.show_upload_file = True
+                st.session_state.show_create_file = False
+
+        # Create File Dialog
+        if st.session_state.get("show_create_file"):
+            with st.container():
+                st.markdown("---")
+                st.markdown("**Create New File**")
+                new_file_path = st.text_input(
+                    "File path (relative to agent folder)",
+                    value="",
+                    key="new-file-path",
+                    placeholder="e.g., src/utils.py or config.json",
+                )
+                new_file_content = st.text_area(
+                    "File content",
+                    value="",
+                    height=200,
+                    key="new-file-content",
+                    placeholder="Enter file content here...",
+                )
+                create_col1, create_col2 = st.columns([0.5, 0.5])
+                with create_col1:
+                    if st.button("Save File", key="save-new-file-btn", type="primary"):
+                        if new_file_path and new_file_path.strip():
+                            try:
+                                target_path = selected_agent / new_file_path.strip()
+                                # Create parent directories if needed
+                                target_path.parent.mkdir(parents=True, exist_ok=True)
+                                target_path.write_text(new_file_content)
+                                st.success(f"Created: {new_file_path}")
+                                st.session_state.show_create_file = False
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Failed to create file: {e}")
+                        else:
+                            st.warning("Please enter a file path.")
+                with create_col2:
+                    if st.button("Cancel", key="cancel-create-file-btn"):
+                        st.session_state.show_create_file = False
+                        st.rerun()
+                st.markdown("---")
+
+        # Upload File Dialog
+        if st.session_state.get("show_upload_file"):
+            with st.container():
+                st.markdown("---")
+                st.markdown("**Upload File**")
+                upload_subdir = st.text_input(
+                    "Upload to subfolder (optional)",
+                    value="",
+                    key="upload-subdir",
+                    placeholder="e.g., src/ or leave empty for root",
+                )
+                uploaded_files = st.file_uploader(
+                    "Choose files to upload",
+                    accept_multiple_files=True,
+                    key="file-uploader",
+                )
+                upload_col1, upload_col2 = st.columns([0.5, 0.5])
+                with upload_col1:
+                    if st.button("Upload", key="confirm-upload-btn", type="primary"):
+                        if uploaded_files:
+                            upload_count = 0
+                            for uploaded_file in uploaded_files:
+                                try:
+                                    if upload_subdir and upload_subdir.strip():
+                                        target_dir = selected_agent / upload_subdir.strip()
+                                    else:
+                                        target_dir = selected_agent
+                                    target_dir.mkdir(parents=True, exist_ok=True)
+                                    target_path = target_dir / uploaded_file.name
+                                    target_path.write_bytes(uploaded_file.getbuffer())
+                                    upload_count += 1
+                                except Exception as e:
+                                    st.error(f"Failed to upload {uploaded_file.name}: {e}")
+                            if upload_count > 0:
+                                st.success(f"Uploaded {upload_count} file(s).")
+                                st.session_state.show_upload_file = False
+                                st.rerun()
+                        else:
+                            st.warning("Please select files to upload.")
+                with upload_col2:
+                    if st.button("Cancel", key="cancel-upload-btn"):
+                        st.session_state.show_upload_file = False
+                        st.rerun()
+                st.markdown("---")
+
+        # File browser
         file_list = list_files(selected_agent)
         if not file_list:
-            st.info("No files found.")
+            st.info("No files found. Use the buttons above to create or upload files.")
         else:
             file_options = [str(path.relative_to(selected_agent)) for path in file_list]
             selected_rel = st.selectbox("File", file_options)
@@ -2393,9 +2692,33 @@ with right:
                     height=360,
                     help="Edit and save changes directly.",
                 )
-                if st.button("Save file"):
-                    selected_path.write_text(edited)
-                    st.success("Saved.")
+                col_save, col_delete = st.columns([0.5, 0.5])
+                with col_save:
+                    if st.button("Save file", key="save-existing-file"):
+                        selected_path.write_text(edited)
+                        st.success("Saved.")
+                with col_delete:
+                    if st.button("Delete file", key="delete-existing-file"):
+                        st.session_state.confirm_delete_file = selected_rel
+
+            # Delete file confirmation
+            if st.session_state.get("confirm_delete_file") == selected_rel:
+                st.warning(f"Are you sure you want to delete '{selected_rel}'?")
+                del_col1, del_col2 = st.columns([0.5, 0.5])
+                with del_col1:
+                    if st.button("Yes, delete", key="confirm-delete-file-yes", type="primary"):
+                        try:
+                            selected_path.unlink()
+                            st.success(f"Deleted: {selected_rel}")
+                            st.session_state.confirm_delete_file = None
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Failed to delete: {e}")
+                with del_col2:
+                    if st.button("Cancel", key="confirm-delete-file-no"):
+                        st.session_state.confirm_delete_file = None
+                        st.rerun()
+
         st.markdown("</div>", unsafe_allow_html=True)
 
     with env_tab:
@@ -2796,8 +3119,10 @@ with right:
         if not profile_labels:
             st.warning("Add run profiles before creating schedules or triggers.")
         else:
+            # Automation type selector OUTSIDE form so it triggers re-render
+            rule_kind = st.selectbox("Automation type", ["Schedule", "Event"], key=f"rule-kind-{selected_agent.name}")
+
             with st.form(f"add-trigger-{selected_agent.name}"):
-                rule_kind = st.selectbox("Automation type", ["Schedule", "Event"])
                 label = st.text_input("Label", value="")
                 profile_choice = st.selectbox("Run profile", profile_labels)
                 enabled = st.checkbox("Enabled", value=True)
