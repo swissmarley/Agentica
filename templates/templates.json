@@ -7,7 +7,7 @@
       "profiles": [
         {
           "label": "streamlit",
-          "command": "streamlit run agent.py --server.port 8510 --server.headless true",
+          "command": "streamlit run agent.py --server.port 8551 --server.headless true",
           "streamlit_port": 8551
         }
       ]
@@ -19,7 +19,7 @@
       "profiles": [
         {
           "label": "streamlit",
-          "command": "streamlit run app.py --server.port 8510 --server.headless true",
+          "command": "streamlit run app.py --server.port 8552 --server.headless true",
           "streamlit_port": 8552
         },
         {
@@ -36,7 +36,7 @@
       "profiles": [
         {
           "label": "streamlit",
-          "command": "streamlit run app.py --server.port 8510 --server.headless true",
+          "command": "streamlit run app.py --server.port 8553 --server.headless true",
           "streamlit_port": 8553
         }
       ]
@@ -48,7 +48,7 @@
       "profiles": [
         {
           "label": "streamlit",
-          "command": "streamlit run dashboard.py --server.port 8510 --server.headless true",
+          "command": "streamlit run dashboard.py --server.port 8554 --server.headless true",
           "streamlit_port": 8554
         },
         {
@@ -70,7 +70,7 @@
         },
         {
           "label": "streamlit",
-          "command": "streamlit run dashboard.py --server.port 8510 --server.headless true",
+          "command": "streamlit run dashboard.py --server.port 8555 --server.headless true",
           "streamlit_port": 8555
         }
       ]
