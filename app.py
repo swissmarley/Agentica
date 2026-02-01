@@ -18,11 +18,12 @@ import zipfile
 import tempfile
 import shutil
 import urllib.request
+import urllib.error
 import difflib
 import sqlite3
 import re
 from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import dataclass
 from pathlib import Path
@@ -1500,6 +1501,15 @@ def publish_to_registry(bundle_path: Path) -> None:
     save_registry_index(index)
 
 
+def import_from_registry(bundle_name: str, overwrite: bool) -> tuple[bool, str]:
+    if not bundle_name:
+        return False, "Missing bundle name."
+    bundle_path = REGISTRY_DIR / bundle_name
+    if not bundle_path.exists():
+        return False, "Bundle not found in registry."
+    return import_agent_bundle(bundle_path.read_bytes(), overwrite)
+
+
 def publish_to_remote_registry(bundle_path: Path, endpoint: str, api_key: str) -> tuple[bool, str]:
     if not endpoint.strip():
         return False, "Missing registry endpoint."
@@ -1518,6 +1528,104 @@ def publish_to_remote_registry(bundle_path: Path, endpoint: str, api_key: str) -
             return False, f"Registry returned {resp.status}."
     except Exception as exc:
         return False, f"Registry error: {exc}"
+
+
+def _encode_multipart_form_data(
+    field_name: str,
+    filename: str,
+    content_type: str,
+    file_bytes: bytes,
+) -> tuple[bytes, str]:
+    boundary = uuid.uuid4().hex
+    crlf = b"\r\n"
+    boundary_bytes = boundary.encode("ascii")
+    body = b"".join(
+        [
+            b"--" + boundary_bytes + crlf,
+            f'Content-Disposition: form-data; name="{field_name}"; filename="{filename}"'.encode("utf-8")
+            + crlf,
+            f"Content-Type: {content_type}".encode("utf-8") + crlf + crlf,
+            file_bytes,
+            crlf,
+            b"--" + boundary_bytes + b"--" + crlf,
+        ]
+    )
+    return body, f"multipart/form-data; boundary={boundary}"
+
+
+def push_bundle_to_marketplace(bundle_path: Path, marketplace_url: str) -> tuple[bool, str]:
+    if not bundle_path.exists():
+        return False, "Bundle file not found."
+    if not marketplace_url.strip():
+        return False, "Missing marketplace URL."
+    url = marketplace_url.rstrip("/") + "/api/push"
+    try:
+        file_bytes = bundle_path.read_bytes()
+        body, content_type = _encode_multipart_form_data(
+            "file",
+            bundle_path.name,
+            "application/zip",
+            file_bytes,
+        )
+        headers = {
+            "Content-Type": content_type,
+            "Content-Length": str(len(body)),
+        }
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            payload = resp.read()
+            if 200 <= resp.status < 300:
+                message = "Uploaded to marketplace."
+                try:
+                    data = json.loads(payload.decode("utf-8") or "{}")
+                    agent_name = data.get("agent", {}).get("name")
+                    agent_version = data.get("agent", {}).get("version")
+                    if agent_name and agent_version:
+                        message = f"Uploaded {agent_name} v{agent_version} to marketplace."
+                except Exception:
+                    pass
+                return True, message
+            return False, f"Marketplace returned {resp.status}."
+    except urllib.error.HTTPError as exc:
+        return False, f"Marketplace error: {exc.code}."
+    except Exception as exc:
+        return False, f"Marketplace error: {exc}"
+
+
+def pull_bundle_from_marketplace(
+    agent_name: str,
+    marketplace_url: str,
+    overwrite: bool,
+    version: str | None = None,
+) -> tuple[bool, str]:
+    if not agent_name.strip():
+        return False, "Provide an agent name."
+    if not marketplace_url.strip():
+        return False, "Missing marketplace URL."
+    base = marketplace_url.rstrip("/")
+    meta_url = f"{base}/api/pull/{agent_name}"
+    if version:
+        meta_url += f"?version={quote(version)}"
+    try:
+        with urllib.request.urlopen(meta_url, timeout=20) as resp:
+            payload = resp.read()
+            data = json.loads(payload.decode("utf-8") or "{}")
+            download_url = data.get("download_url")
+            version = data.get("version")
+        if not download_url:
+            return False, "Marketplace did not provide a download URL."
+        with urllib.request.urlopen(download_url, timeout=30) as resp:
+            bundle_bytes = resp.read()
+        ok, message = import_agent_bundle(bundle_bytes, overwrite)
+        if ok and version:
+            return True, f"Imported {agent_name} v{version}."
+        return ok, message
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return False, f"Agent '{agent_name}' not found."
+        return False, f"Marketplace error: {exc.code}."
+    except Exception as exc:
+        return False, f"Marketplace error: {exc}"
 
 
 def publish_to_github(agent_path: Path, repo_url: str, branch: str) -> tuple[bool, str]:
@@ -3418,6 +3526,12 @@ with right:
             st.session_state[f"bundle-path-{selected_agent.name}"] = str(bundle_path)
             st.success(f"Bundle created: {bundle_path.name}")
 
+        if st.button("Build & publish to internal registry", key=f"build-publish-registry-{selected_agent.name}"):
+            bundle_path = export_agent_bundle(selected_agent.name, selected_agent)
+            publish_to_registry(bundle_path)
+            st.session_state[f"bundle-path-{selected_agent.name}"] = str(bundle_path)
+            st.success("Published to internal registry.")
+
         bundle_path_str = st.session_state.get(f"bundle-path-{selected_agent.name}")
         if bundle_path_str:
             bundle_path = Path(bundle_path_str)
@@ -3451,6 +3565,50 @@ with right:
                         st.success(message)
                     else:
                         st.error(message)
+
+        st.markdown("#### Marketplace push / pull")
+        marketplace_url = st.text_input(
+            "Marketplace URL",
+            value=st.session_state.get("marketplace-url", "http://127.0.0.1:5000"),
+            key="marketplace-url",
+        )
+
+        if st.button("Build & push to marketplace", key=f"push-marketplace-{selected_agent.name}"):
+            bundle_path = export_agent_bundle(selected_agent.name, selected_agent)
+            ok, message = push_bundle_to_marketplace(bundle_path, marketplace_url)
+            if ok:
+                st.success(message)
+            else:
+                st.error(message)
+
+        pull_agent_name = st.text_input(
+            "Agent name to pull",
+            value=selected_agent.name,
+            key=f"pull-name-{selected_agent.name}",
+        )
+        pull_version = st.text_input(
+            "Version (optional)",
+            value="",
+            key=f"pull-version-{selected_agent.name}",
+            placeholder="e.g. 1.2.0",
+        )
+        pull_overwrite = st.checkbox(
+            "Overwrite if agent exists",
+            value=False,
+            key=f"pull-overwrite-{selected_agent.name}",
+        )
+        if st.button("Pull from marketplace", key=f"pull-marketplace-{selected_agent.name}"):
+            ok, message = pull_bundle_from_marketplace(
+                pull_agent_name.strip(),
+                marketplace_url,
+                pull_overwrite,
+                pull_version.strip() or None,
+            )
+            if ok:
+                st.success(message)
+                st.rerun()
+            else:
+                st.error(message)
 
         st.markdown("#### Publish to GitHub")
         repo_url = st.text_input("Repo URL", value="", key=f"repo-url-{selected_agent.name}")
@@ -3489,10 +3647,35 @@ with right:
 
         st.markdown("#### Internal registry")
         index = load_registry_index()
-        if not index.get("bundles"):
+        bundles = index.get("bundles", [])
+        if not bundles:
             st.caption("No bundles published yet.")
         else:
-            for item in index.get("bundles", []):
+            labels = [
+                f"{item.get('name','')} v{item.get('version','')} · {item.get('bundle','')}"
+                for item in bundles
+            ]
+            selection = st.selectbox(
+                "Registry bundles",
+                labels,
+                key=f"registry-select-{selected_agent.name}",
+            )
+            selected_idx = labels.index(selection)
+            overwrite_registry = st.checkbox(
+                "Overwrite if agent exists",
+                value=False,
+                key=f"registry-overwrite-{selected_agent.name}",
+            )
+            if st.button("Install from internal registry", key=f"registry-install-{selected_agent.name}"):
+                bundle_name = bundles[selected_idx].get("bundle", "")
+                ok, message = import_from_registry(bundle_name, overwrite_registry)
+                if ok:
+                    st.success(message)
+                    st.rerun()
+                else:
+                    st.error(message)
+            st.markdown("#### Registry contents")
+            for item in bundles:
                 st.markdown(
                     f"- **{item.get('name','')}** v{item.get('version','')} · "
                     f"tags: {', '.join(item.get('tags', []))} · "

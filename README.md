@@ -193,11 +193,31 @@ Agentica can export/import agents as bundles:
 - Bundles include metadata (name, version, tags, requirements) and run profiles
 - Import bundles to create agents from files + manifest
 - Publish bundles to an internal registry (`registry/`)
+- Install bundles back from the internal registry
 - Publish bundles to an external registry endpoint (with optional API key)
 - Push agents to GitHub repositories
 - Bundles seed env keys (values are never exported)
 
 Marketplace controls live in the **Marketplace** tab per agent.
+
+### Marketplace Server (Flask)
+The Marketplace server lives under `marketplace/` and exposes:
+- `POST /api/push` to upload bundles
+- `GET /api/pull/<agent_name>?version=...` to download bundles (latest when version omitted)
+
+The Marketplace UI groups all versions of an agent under one card with a version selector.
+The pull command and download link update per selected version.
+
+Run the server locally:
+```bash
+python marketplace/app.py
+```
+
+### Agentica App Integration
+From the **Marketplace** tab you can:
+- **Build & push** a bundle directly to the Marketplace
+- **Pull** from the Marketplace by name (optionally specify a version)
+- **Build & publish** to internal registry, then **install** from the registry list
 
 ---
 
