@@ -1,0 +1,12 @@
+fastapi 
+uvicorn 
+google-auth 
+google-api-python-client 
+gspread 
+langchain-google-genai 
+langchain 
+requests 
+python-dotenv
+langchain-core
+streamlit 
+pandas

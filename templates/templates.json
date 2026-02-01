@@ -1,0 +1,79 @@
+{
+  "templates": [
+    {
+      "name": "Hiring Agent",
+      "description": "AI-powered CV screener with Streamlit UI and Google Sheets logging.",
+      "root": "templates/hiring_agent",
+      "profiles": [
+        {
+          "label": "streamlit",
+          "command": "streamlit run agent.py --server.port 8551 --server.headless true",
+          "streamlit_port": 8551
+        }
+      ]
+    },
+    {
+      "name": "Multi Agent",
+      "description": "Multi-role agentic workflow with UI and CLI flows.",
+      "root": "templates/multi_agent",
+      "profiles": [
+        {
+          "label": "streamlit",
+          "command": "streamlit run app.py --server.port 8552 --server.headless true",
+          "streamlit_port": 8552
+        },
+        {
+          "label": "backend",
+          "command": "python3 main.py",
+          "streamlit_port": null
+        }
+      ]
+    },
+    {
+      "name": "News Scraper Agent",
+      "description": "Streamlit news scraper with configurable sources and reader UI.",
+      "root": "templates/news_agent",
+      "profiles": [
+        {
+          "label": "streamlit",
+          "command": "streamlit run app.py --server.port 8553 --server.headless true",
+          "streamlit_port": 8553
+        }
+      ]
+    },
+    {
+      "name": "Security Agent",
+      "description": "Security assistant with Streamlit dashboard and Discord bot.",
+      "root": "templates/security_agent",
+      "profiles": [
+        {
+          "label": "streamlit",
+          "command": "streamlit run dashboard.py --server.port 8554 --server.headless true",
+          "streamlit_port": 8554
+        },
+        {
+          "label": "bot",
+          "command": "python3 bot.py",
+          "streamlit_port": null
+        }
+      ]
+    },
+    {
+      "name": "WhatsApp Supportbot",
+      "description": "FastAPI WhatsApp agent with Streamlit monitoring dashboard.",
+      "root": "templates/whatsapp_rag",
+      "profiles": [
+        {
+          "label": "backend",
+          "command": "uvicorn agent:app --reload --host 0.0.0.0 --port 8000",
+          "streamlit_port": null
+        },
+        {
+          "label": "streamlit",
+          "command": "streamlit run dashboard.py --server.port 8555 --server.headless true",
+          "streamlit_port": 8555
+        }
+      ]
+    }
+  ]
+}

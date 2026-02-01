@@ -1,0 +1,6 @@
+streamlit 
+google-generativeai 
+gspread 
+oauth2client 
+PyPDF2
+python-dotenv

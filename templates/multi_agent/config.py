@@ -9,6 +9,6 @@ REQUIRED_ENV_VARS = ["ANTHROPIC_API_KEY", "GITHUB_TOKEN"]
 
 # Output Configuration
 OUTPUT_DIR = "workflow_outputs"
-GITHUB_REPO = "githubuser/githubrepo" # CHANGE THIS or set via env var
+GITHUB_REPO = "swissmarley/AgentOutputs" # CHANGE THIS or set via env var
 
 MAX_OUTPUT_TOKENS = 8000
