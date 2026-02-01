@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agentica Marketplace</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #0f172a; }
+        ::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+        .glass-panel { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.1); }
+    </style>
+</head>
+<body class="bg-slate-900 text-white min-h-screen font-sans">
+
+    <nav class="border-b border-slate-700 bg-slate-900/80 backdrop-blur-md sticky top-0 z-50">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex items-center justify-between h-16">
+                <div class="flex items-center gap-2">
+                    <i data-lucide="bot" class="w-8 h-8 text-indigo-500"></i>
+                    <span class="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-indigo-400 to-cyan-400">Agentica Hub</span>
+                </div>
+                <div class="flex gap-4">
+                    <button onclick="document.getElementById('docsModal').classList.remove('hidden')" class="text-slate-300 hover:text-white px-3 py-2 text-sm font-medium">
+                        How to Use
+                    </button>
+                </div>
+            </div>
+        </div>
+    </nav>
+
+    <div class="relative overflow-hidden py-16 text-center">
+        <h1 class="text-4xl md:text-5xl font-extrabold tracking-tight mb-4">Discover & Share AI Agents</h1>
+        <p class="text-xl text-slate-400 max-w-2xl mx-auto mb-8">Push and pull agents directly from your Agentica CLI.</p>
+        <button onclick="document.getElementById('uploadModal').classList.remove('hidden')" class="bg-indigo-600 hover:bg-indigo-700 text-white px-6 py-3 rounded-lg font-semibold inline-flex items-center gap-2 transition-all">
+            <i data-lucide="upload-cloud" class="w-5 h-5"></i> Manual Upload
+        </button>
+    </div>
+
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
+        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+            {% for agent in agents %}
+            <div class="glass-panel rounded-xl p-6 flex flex-col h-full hover:border-indigo-500 transition-colors">
+                <div class="flex justify-between items-start mb-4">
+                    <div class="p-3 bg-indigo-500/10 rounded-lg"><i data-lucide="box" class="w-8 h-8 text-indigo-400"></i></div>
+                    <span class="px-2 py-1 bg-slate-700 rounded text-xs font-mono text-slate-300 version-badge">v{{ agent.latest.version }}</span>
+                </div>
+                <h3 class="text-xl font-bold text-white mb-2">{{ agent.name }}</h3>
+                <p class="text-slate-400 text-sm mb-4 flex-grow">{{ agent.latest.description }}</p>
+
+                <div class="mb-4">
+                    <label class="block text-xs uppercase tracking-wide text-slate-400 mb-1">Version</label>
+                    <select class="version-select w-full bg-slate-950 border border-slate-800 rounded-md px-3 py-2 text-sm text-slate-200">
+                        {% for v in agent.versions %}
+                        <option value="{{ v.version }}" data-filename="{{ v.filename }}">v{{ v.version }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                
+                <div class="bg-slate-950 rounded-md p-3 mb-4 flex items-center justify-between border border-slate-800">
+                    <code class="text-xs text-green-400 font-mono command-text">agentica pull {{ agent.name }}</code>
+                    <button class="copy-command text-slate-500 hover:text-white">
+                        <i data-lucide="copy" class="w-4 h-4"></i>
+                    </button>
+                </div>
+
+                <div class="border-t border-slate-700 pt-4 flex items-center justify-between">
+                    <div class="text-xs text-slate-500">By {{ agent.latest.author }}</div>
+                    <a href="{{ url_for('download_agent', filename=agent.latest.filename) }}" class="download-link text-sm font-medium text-indigo-400 hover:text-indigo-300 flex items-center gap-1">
+                        <i data-lucide="download" class="w-4 h-4"></i> Download Zip
+                    </a>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    </main>
+
+    <div id="uploadModal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+        <div class="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-md p-6 relative">
+            <button onclick="document.getElementById('uploadModal').classList.add('hidden')" class="absolute top-4 right-4 text-slate-400"><i data-lucide="x" class="w-6 h-6"></i></button>
+            <h2 class="text-2xl font-bold mb-4">Manual Upload</h2>
+            <form action="/upload" method="post" enctype="multipart/form-data" class="space-y-4">
+                <input type="file" name="agent_file" accept=".zip" class="w-full text-slate-400 file:bg-indigo-600 file:text-white file:border-0 file:rounded-full file:px-4 file:py-2">
+                <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white py-2 rounded-lg">Upload</button>
+            </form>
+        </div>
+    </div>
+
+    <div id="docsModal" class="hidden fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+        <div class="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-2xl p-8 relative max-h-[80vh] overflow-y-auto">
+            <button onclick="document.getElementById('docsModal').classList.add('hidden')" class="absolute top-4 right-4 text-slate-400"><i data-lucide="x" class="w-6 h-6"></i></button>
+            
+            <h2 class="text-2xl font-bold mb-6 text-indigo-400">How to use with Agentica CLI</h2>
+            
+            <div class="space-y-6">
+                <div>
+                    <h3 class="text-lg font-semibold text-white mb-2">1. Pull an Agent (Install)</h3>
+                    <p class="text-slate-400 text-sm mb-2">Download an agent from the marketplace into your local environment.</p>
+                    <div class="bg-slate-950 p-4 rounded border border-slate-800 font-mono text-sm text-green-400">
+                        agentica pull &lt;agent_name&gt; --version &lt;version&gt;
+                    </div>
+                </div>
+
+                <div>
+                    <h3 class="text-lg font-semibold text-white mb-2">2. Push an Agent (Publish)</h3>
+                    <p class="text-slate-400 text-sm mb-2">Upload your local agent bundle to the marketplace.</p>
+                    <div class="bg-slate-950 p-4 rounded border border-slate-800 font-mono text-sm text-green-400">
+                        agentica push path/to/agent.zip
+                    </div>
+                </div>
+
+                <div class="bg-indigo-900/20 p-4 rounded border border-indigo-500/30">
+                    <p class="text-sm text-indigo-300">
+                        <strong>Note:</strong> Ensure your <code>agentica_manifest.json</code> is valid before pushing.
+                    </p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        lucide.createIcons();
+        document.querySelectorAll('.glass-panel').forEach(card => {
+            const select = card.querySelector('.version-select');
+            const badge = card.querySelector('.version-badge');
+            const download = card.querySelector('.download-link');
+            const command = card.querySelector('.command-text');
+            const copyBtn = card.querySelector('.copy-command');
+            const agentName = card.querySelector('h3')?.textContent?.trim() || '';
+
+            const sync = () => {
+                const option = select.options[select.selectedIndex];
+                const version = option.value;
+                const filename = option.dataset.filename;
+                badge.textContent = `v${version}`;
+                download.setAttribute('href', `/download/${filename}`);
+                command.textContent = `agentica pull ${agentName} --version ${version}`;
+            };
+
+            sync();
+            select.addEventListener('change', sync);
+            copyBtn.addEventListener('click', () => {
+                navigator.clipboard.writeText(command.textContent);
+                alert('Command copied!');
+            });
+        });
+    </script>
+</body>
+</html>
